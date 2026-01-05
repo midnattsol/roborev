@@ -8,6 +8,39 @@ import (
 	"github.com/user/roborev/internal/storage"
 )
 
+// SystemPrompt is the base instruction for code reviews
+const SystemPrompt = `You are a code reviewer. Review the git commit shown below for:
+
+1. **Bugs**: Logic errors, off-by-one errors, null/undefined issues, race conditions
+2. **Security**: Injection vulnerabilities, auth issues, data exposure
+3. **Testing gaps**: Missing unit tests, edge cases not covered, e2e/integration test gaps
+4. **Regressions**: Changes that might break existing functionality
+5. **Code quality**: Duplication that should be refactored, overly complex logic, unclear naming
+
+After reviewing against all criteria above:
+
+If you find issues, list them with:
+- Severity (high/medium/low)
+- File and line reference where possible
+- A brief explanation of the problem and suggested fix
+
+If you find no issues, confirm you checked for bugs, security issues, testing gaps,
+regressions, and code quality concerns, then briefly summarize what the commit does.`
+
+// PreviousReviewsHeader introduces the previous reviews section
+const PreviousReviewsHeader = `
+## Previous Reviews
+
+The following are reviews of recent commits in this repository. Use them as context
+to understand ongoing work and to check if the current commit addresses previous feedback.
+`
+
+// ReviewContext holds a commit SHA and its associated review (if any)
+type ReviewContext struct {
+	SHA    string
+	Review *storage.Review
+}
+
 // Builder constructs review prompts
 type Builder struct {
 	db *storage.DB
@@ -18,78 +51,77 @@ func NewBuilder(db *storage.DB) *Builder {
 	return &Builder{db: db}
 }
 
-// Build constructs a review prompt for a commit
+// Build constructs a review prompt for a commit with context from previous reviews
 func (b *Builder) Build(repoPath, sha string, repoID int64, contextCount int) (string, error) {
 	var sb strings.Builder
 
-	// Header
-	sb.WriteString("# Code Review Request\n\n")
-
-	// Get commit info
-	info, err := git.GetCommitInfo(repoPath, sha)
-	if err != nil {
-		return "", fmt.Errorf("get commit info: %w", err)
-	}
-
-	sb.WriteString("## Commit Details\n\n")
-	sb.WriteString(fmt.Sprintf("- **SHA**: %s\n", info.SHA))
-	sb.WriteString(fmt.Sprintf("- **Author**: %s\n", info.Author))
-	sb.WriteString(fmt.Sprintf("- **Subject**: %s\n", info.Subject))
-	sb.WriteString(fmt.Sprintf("- **Date**: %s\n", info.Timestamp.Format("2006-01-02 15:04:05")))
+	// Start with system prompt
+	sb.WriteString(SystemPrompt)
 	sb.WriteString("\n")
 
-	// Get files changed
-	files, err := git.GetFilesChanged(repoPath, sha)
-	if err != nil {
-		return "", fmt.Errorf("get files changed: %w", err)
-	}
-
-	sb.WriteString("## Files Changed\n\n")
-	for _, f := range files {
-		sb.WriteString(fmt.Sprintf("- %s\n", f))
-	}
-	sb.WriteString("\n")
-
-	// Get the diff
-	diff, err := git.GetDiff(repoPath, sha)
-	if err != nil {
-		return "", fmt.Errorf("get diff: %w", err)
-	}
-
-	sb.WriteString("## Diff\n\n```diff\n")
-	sb.WriteString(diff)
-	sb.WriteString("```\n\n")
-
-	// Get recent reviews for context
+	// Get previous reviews if requested
 	if contextCount > 0 && b.db != nil {
-		reviews, err := b.db.GetRecentReviewsForRepo(repoID, contextCount)
-		if err == nil && len(reviews) > 0 {
-			sb.WriteString("## Recent Reviews (for context)\n\n")
-			for i, r := range reviews {
-				sb.WriteString(fmt.Sprintf("### Review %d (by %s)\n\n", i+1, r.Agent))
-				// Truncate long outputs for context
-				output := r.Output
-				if len(output) > 500 {
-					output = output[:500] + "...(truncated)"
+		contexts, err := b.getPreviousReviewContexts(repoPath, sha, contextCount)
+		if err != nil {
+			// Log but don't fail - previous reviews are nice-to-have context
+			// Just continue without them
+		} else if len(contexts) > 0 {
+			sb.WriteString(PreviousReviewsHeader)
+			sb.WriteString("\n")
+
+			// Show in chronological order (oldest first) for narrative flow
+			for i := len(contexts) - 1; i >= 0; i-- {
+				ctx := contexts[i]
+				shortSHA := ctx.SHA
+				if len(shortSHA) > 7 {
+					shortSHA = shortSHA[:7]
 				}
-				sb.WriteString(output)
+
+				sb.WriteString(fmt.Sprintf("--- Review for commit %s ---\n", shortSHA))
+				if ctx.Review != nil {
+					sb.WriteString(ctx.Review.Output)
+				} else {
+					sb.WriteString("No review available.")
+				}
 				sb.WriteString("\n\n")
 			}
 		}
 	}
 
-	// Review instructions
-	sb.WriteString("## Review Instructions\n\n")
-	sb.WriteString("Please review this commit for:\n\n")
-	sb.WriteString("1. **Correctness**: Logic errors, bugs, edge cases not handled\n")
-	sb.WriteString("2. **Behavior Regressions**: Changes that might break existing functionality\n")
-	sb.WriteString("3. **Testing Gaps**: Missing tests, especially end-to-end tests for frontend changes\n")
-	sb.WriteString("4. **Security Issues**: Potential vulnerabilities (injection, XSS, etc.)\n")
-	sb.WriteString("5. **Performance**: Obvious performance problems or improvements\n\n")
-	sb.WriteString("Focus on substantive issues. Don't comment on style unless it impacts readability significantly.\n\n")
-	sb.WriteString("If the commit looks good, say so briefly. If there are issues, be specific about what and where.\n")
+	// Current commit section
+	shortSHA := sha
+	if len(shortSHA) > 7 {
+		shortSHA = shortSHA[:7]
+	}
+	sb.WriteString("## Current Commit\n\n")
+	sb.WriteString(fmt.Sprintf("Review the following commit: %s\n", shortSHA))
 
 	return sb.String(), nil
+}
+
+// getPreviousReviewContexts gets the N commits before the target and looks up their reviews
+func (b *Builder) getPreviousReviewContexts(repoPath, sha string, count int) ([]ReviewContext, error) {
+	// Get parent commits from git
+	parentSHAs, err := git.GetParentCommits(repoPath, sha, count)
+	if err != nil {
+		return nil, fmt.Errorf("get parent commits: %w", err)
+	}
+
+	var contexts []ReviewContext
+	for _, parentSHA := range parentSHAs {
+		ctx := ReviewContext{SHA: parentSHA}
+
+		// Try to look up review for this commit
+		review, err := b.db.GetReviewByCommitSHA(parentSHA)
+		if err == nil {
+			ctx.Review = review
+		}
+		// If no review found, ctx.Review stays nil
+
+		contexts = append(contexts, ctx)
+	}
+
+	return contexts, nil
 }
 
 // BuildSimple constructs a simpler prompt without database context

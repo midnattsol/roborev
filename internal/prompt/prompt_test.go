@@ -1,0 +1,290 @@
+package prompt
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/user/roborev/internal/storage"
+)
+
+// setupTestRepo creates a git repo with multiple commits and returns the repo path and commit SHAs
+func setupTestRepo(t *testing.T) (string, []string) {
+	t.Helper()
+	tmpDir := t.TempDir()
+
+	runGit := func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Test",
+			"GIT_AUTHOR_EMAIL=test@test.com",
+			"GIT_COMMITTER_NAME=Test",
+			"GIT_COMMITTER_EMAIL=test@test.com",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGit("init")
+	runGit("config", "user.email", "test@test.com")
+	runGit("config", "user.name", "Test")
+
+	var commits []string
+
+	// Create 6 commits so we can test with 5 previous commits
+	for i := 1; i <= 6; i++ {
+		filename := filepath.Join(tmpDir, "file.txt")
+		content := strings.Repeat("x", i) // Different content each time
+		if err := os.WriteFile(filename, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+		runGit("add", "file.txt")
+		runGit("commit", "-m", "commit "+string(rune('0'+i)))
+
+		sha := runGit("rev-parse", "HEAD")
+		commits = append(commits, sha)
+	}
+
+	return tmpDir, commits
+}
+
+func TestBuildPromptWithoutContext(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Build prompt without database (no previous reviews)
+	prompt, err := BuildSimple(repoPath, targetSHA)
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	// Should contain system prompt
+	if !strings.Contains(prompt, "You are a code reviewer") {
+		t.Error("Prompt should contain system prompt")
+	}
+
+	// Should contain the 5 review criteria
+	expectedCriteria := []string{"Bugs", "Security", "Testing gaps", "Regressions", "Code quality"}
+	for _, criteria := range expectedCriteria {
+		if !strings.Contains(prompt, criteria) {
+			t.Errorf("Prompt should contain %q", criteria)
+		}
+	}
+
+	// Should contain current commit section
+	if !strings.Contains(prompt, "## Current Commit") {
+		t.Error("Prompt should contain current commit section")
+	}
+
+	// Should contain short SHA
+	shortSHA := targetSHA[:7]
+	if !strings.Contains(prompt, shortSHA) {
+		t.Errorf("Prompt should contain short SHA %s", shortSHA)
+	}
+
+	// Should NOT contain previous reviews section (no db)
+	if strings.Contains(prompt, "## Previous Reviews") {
+		t.Error("Prompt should not contain previous reviews section without db")
+	}
+}
+
+func TestBuildPromptWithPreviousReviews(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+
+	// Setup test database
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open test DB: %v", err)
+	}
+	defer db.Close()
+
+	// Create repo and commits in DB
+	repo, err := db.GetOrCreateRepo(repoPath)
+	if err != nil {
+		t.Fatalf("GetOrCreateRepo failed: %v", err)
+	}
+
+	// Create reviews for commits 2, 3, and 4 (leaving 1 and 5 without reviews)
+	reviewTexts := map[int]string{
+		1: "Review for commit 2: Found a bug in error handling",
+		2: "Review for commit 3: No issues found",
+		3: "Review for commit 4: Security issue - missing input validation",
+	}
+
+	for i, sha := range commits[:5] { // First 5 commits (parents of commit 6)
+		commit, err := db.GetOrCreateCommit(repo.ID, sha, "Test", "commit message", time.Now())
+		if err != nil {
+			t.Fatalf("GetOrCreateCommit failed: %v", err)
+		}
+
+		// Create review for some commits
+		if reviewText, ok := reviewTexts[i]; ok {
+			job, err := db.EnqueueJob(repo.ID, commit.ID, "test")
+			if err != nil {
+				t.Fatalf("EnqueueJob failed: %v", err)
+			}
+			_, err = db.ClaimJob("test-worker")
+			if err != nil {
+				t.Fatalf("ClaimJob failed: %v", err)
+			}
+			err = db.CompleteJob(job.ID, "test", "test prompt", reviewText)
+			if err != nil {
+				t.Fatalf("CompleteJob failed: %v", err)
+			}
+		}
+	}
+
+	// Also add commit 6 to DB (the target commit)
+	_, err = db.GetOrCreateCommit(repo.ID, commits[5], "Test", "commit message", time.Now())
+	if err != nil {
+		t.Fatalf("GetOrCreateCommit failed: %v", err)
+	}
+
+	// Build prompt with 5 previous commits context
+	builder := NewBuilder(db)
+	prompt, err := builder.Build(repoPath, commits[5], repo.ID, 5)
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	// Should contain previous reviews section
+	if !strings.Contains(prompt, "## Previous Reviews") {
+		t.Error("Prompt should contain previous reviews section")
+	}
+
+	// Should contain the review texts we added
+	for _, reviewText := range reviewTexts {
+		if !strings.Contains(prompt, reviewText) {
+			t.Errorf("Prompt should contain review text: %s", reviewText)
+		}
+	}
+
+	// Should contain "No review available" for commits without reviews
+	if !strings.Contains(prompt, "No review available") {
+		t.Error("Prompt should contain 'No review available' for commits without reviews")
+	}
+
+	// Should contain delimiters with short SHAs
+	if !strings.Contains(prompt, "--- Review for commit") {
+		t.Error("Prompt should contain review delimiters")
+	}
+
+	// Verify chronological order (oldest first)
+	// The oldest parent (commit 1) should appear before the newest parent (commit 5)
+	commit1Pos := strings.Index(prompt, commits[0][:7])
+	commit5Pos := strings.Index(prompt, commits[4][:7])
+	if commit1Pos == -1 || commit5Pos == -1 {
+		t.Error("Prompt should contain short SHAs of parent commits")
+	} else if commit1Pos > commit5Pos {
+		t.Error("Commits should be in chronological order (oldest first)")
+	}
+}
+
+func TestBuildPromptWithNoParentCommits(t *testing.T) {
+	// Create a repo with just one commit
+	tmpDir := t.TempDir()
+
+	runGit := func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Test",
+			"GIT_AUTHOR_EMAIL=test@test.com",
+			"GIT_COMMITTER_NAME=Test",
+			"GIT_COMMITTER_EMAIL=test@test.com",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGit("init")
+	runGit("config", "user.email", "test@test.com")
+	runGit("config", "user.name", "Test")
+
+	if err := os.WriteFile(filepath.Join(tmpDir, "file.txt"), []byte("content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "file.txt")
+	runGit("commit", "-m", "initial commit")
+	sha := runGit("rev-parse", "HEAD")
+
+	// Setup test database
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open test DB: %v", err)
+	}
+	defer db.Close()
+
+	// Build prompt - should work even with no parent commits
+	builder := NewBuilder(db)
+	prompt, err := builder.Build(tmpDir, sha, 0, 5)
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	// Should contain system prompt and current commit
+	if !strings.Contains(prompt, "You are a code reviewer") {
+		t.Error("Prompt should contain system prompt")
+	}
+	if !strings.Contains(prompt, "## Current Commit") {
+		t.Error("Prompt should contain current commit section")
+	}
+
+	// Should NOT contain previous reviews (no parents exist)
+	if strings.Contains(prompt, "## Previous Reviews") {
+		t.Error("Prompt should not contain previous reviews section when no parents exist")
+	}
+}
+
+func TestPromptContainsExpectedFormat(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+
+	// Setup test database with one review
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open test DB: %v", err)
+	}
+	defer db.Close()
+
+	repo, _ := db.GetOrCreateRepo(repoPath)
+	commit, _ := db.GetOrCreateCommit(repo.ID, commits[4], "Test", "test", time.Now())
+	job, _ := db.EnqueueJob(repo.ID, commit.ID, "test")
+	db.ClaimJob("test-worker")
+	db.CompleteJob(job.ID, "test", "prompt", "Found 1 issue:\n1. pkg/cache/store.go:112 - Race condition")
+
+	builder := NewBuilder(db)
+	prompt, err := builder.Build(repoPath, commits[5], repo.ID, 3)
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	// Print the prompt for visual inspection
+	t.Logf("Generated prompt:\n%s", prompt)
+
+	// Verify structure
+	sections := []string{
+		"You are a code reviewer",
+		"## Previous Reviews",
+		"--- Review for commit",
+		"## Current Commit",
+	}
+
+	for _, section := range sections {
+		if !strings.Contains(prompt, section) {
+			t.Errorf("Prompt missing section: %s", section)
+		}
+	}
+}

@@ -133,3 +133,26 @@ func ReadFile(repoPath, sha, filePath string) ([]byte, error) {
 
 	return stdout.Bytes(), nil
 }
+
+// GetParentCommits returns the N commits before the given commit (not including it)
+// Returns commits in reverse chronological order (most recent parent first)
+func GetParentCommits(repoPath, sha string, count int) ([]string, error) {
+	// Use git log to get parent commits, skipping the commit itself
+	cmd := exec.Command("git", "log", "--format=%H", "-n", fmt.Sprintf("%d", count), "--skip=1", sha)
+	cmd.Dir = repoPath
+
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git log: %w", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	var commits []string
+	for _, line := range lines {
+		if line != "" {
+			commits = append(commits, line)
+		}
+	}
+
+	return commits, nil
+}

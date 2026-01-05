@@ -26,20 +26,6 @@ func (a *CodexAgent) Name() string {
 	return "codex"
 }
 
-// reviewPrompt is the system prompt for code reviews
-const reviewPrompt = `You are a code reviewer. Review the git commit shown below for:
-
-1. **Bugs**: Logic errors, off-by-one errors, null/undefined issues, race conditions
-2. **Security**: Injection vulnerabilities, auth issues, data exposure
-3. **Regressions**: Changes that might break existing functionality
-
-Focus on substantive issues only. Ignore style, formatting, and minor nitpicks.
-
-If the commit looks good, say "No issues found" with a brief explanation.
-If there are problems, list them concisely with file:line references where possible.
-
-Review the most recent commit in this repository.`
-
 func (a *CodexAgent) Review(ctx context.Context, repoPath, commitSHA, prompt string) (string, error) {
 	// Create temp file for output
 	tmpDir := os.TempDir()
@@ -47,13 +33,14 @@ func (a *CodexAgent) Review(ctx context.Context, repoPath, commitSHA, prompt str
 	defer os.Remove(outputFile)
 
 	// Use codex exec with output capture
+	// The prompt is constructed by the prompt builder with full context
 	args := []string{
 		"exec",
 		"-C", repoPath,
 		"-o", outputFile,
 		"-c", `model_reasoning_effort="high"`,
 		"--full-auto",
-		fmt.Sprintf("%s\n\nCommit to review: %s", reviewPrompt, commitSHA),
+		prompt,
 	}
 
 	cmd := exec.CommandContext(ctx, a.Command, args...)
