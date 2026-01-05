@@ -210,13 +210,24 @@ func (s *Server) handleGetReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sha := r.URL.Query().Get("sha")
-	if sha == "" {
-		writeError(w, http.StatusBadRequest, "sha parameter required")
+	var review *storage.Review
+	var err error
+
+	// Support lookup by job_id (preferred) or sha
+	if jobIDStr := r.URL.Query().Get("job_id"); jobIDStr != "" {
+		var jobID int64
+		if _, err := fmt.Sscanf(jobIDStr, "%d", &jobID); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid job_id")
+			return
+		}
+		review, err = s.db.GetReviewByJobID(jobID)
+	} else if sha := r.URL.Query().Get("sha"); sha != "" {
+		review, err = s.db.GetReviewByCommitSHA(sha)
+	} else {
+		writeError(w, http.StatusBadRequest, "job_id or sha parameter required")
 		return
 	}
 
-	review, err := s.db.GetReviewByCommitSHA(sha)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "review not found")
 		return

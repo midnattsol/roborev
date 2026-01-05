@@ -95,13 +95,12 @@ func Open(dbPath string) (*DB, error) {
 	return &DB{db}, nil
 }
 
-// ResetStaleJobs marks running jobs older than TTL as queued (for daemon restart)
+// ResetStaleJobs marks all running jobs as queued (for daemon restart)
 func (db *DB) ResetStaleJobs() error {
 	_, err := db.Exec(`
 		UPDATE review_jobs
 		SET status = 'queued', worker_id = NULL, started_at = NULL
 		WHERE status = 'running'
-		AND started_at < datetime('now', '-5 minutes')
 	`)
 	return err
 }

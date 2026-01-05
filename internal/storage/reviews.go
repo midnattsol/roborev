@@ -5,7 +5,54 @@ import (
 	"time"
 )
 
-// GetReviewByCommitSHA finds a review by commit SHA
+// GetReviewByJobID finds a review by its job ID
+func (db *DB) GetReviewByJobID(jobID int64) (*Review, error) {
+	var r Review
+	var createdAt string
+	var job ReviewJob
+	var enqueuedAt string
+	var startedAt, finishedAt, workerID, errMsg sql.NullString
+
+	err := db.QueryRow(`
+		SELECT rv.id, rv.job_id, rv.agent, rv.prompt, rv.output, rv.created_at,
+		       j.id, j.repo_id, j.commit_id, j.agent, j.status, j.enqueued_at,
+		       j.started_at, j.finished_at, j.worker_id, j.error,
+		       rp.root_path, rp.name, c.sha, c.subject
+		FROM reviews rv
+		JOIN review_jobs j ON j.id = rv.job_id
+		JOIN repos rp ON rp.id = j.repo_id
+		JOIN commits c ON c.id = j.commit_id
+		WHERE rv.job_id = ?
+	`, jobID).Scan(&r.ID, &r.JobID, &r.Agent, &r.Prompt, &r.Output, &createdAt,
+		&job.ID, &job.RepoID, &job.CommitID, &job.Agent, &job.Status, &enqueuedAt,
+		&startedAt, &finishedAt, &workerID, &errMsg,
+		&job.RepoPath, &job.RepoName, &job.CommitSHA, &job.CommitSubject)
+	if err != nil {
+		return nil, err
+	}
+
+	r.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+	job.EnqueuedAt, _ = time.Parse(time.RFC3339, enqueuedAt)
+	if startedAt.Valid {
+		t, _ := time.Parse(time.RFC3339, startedAt.String)
+		job.StartedAt = &t
+	}
+	if finishedAt.Valid {
+		t, _ := time.Parse(time.RFC3339, finishedAt.String)
+		job.FinishedAt = &t
+	}
+	if workerID.Valid {
+		job.WorkerID = workerID.String
+	}
+	if errMsg.Valid {
+		job.Error = errMsg.String
+	}
+	r.Job = &job
+
+	return &r, nil
+}
+
+// GetReviewByCommitSHA finds the most recent review by commit SHA
 func (db *DB) GetReviewByCommitSHA(sha string) (*Review, error) {
 	var r Review
 	var createdAt string
@@ -23,6 +70,8 @@ func (db *DB) GetReviewByCommitSHA(sha string) (*Review, error) {
 		JOIN repos rp ON rp.id = j.repo_id
 		JOIN commits c ON c.id = j.commit_id
 		WHERE c.sha = ?
+		ORDER BY rv.created_at DESC
+		LIMIT 1
 	`, sha).Scan(&r.ID, &r.JobID, &r.Agent, &r.Prompt, &r.Output, &createdAt,
 		&job.ID, &job.RepoID, &job.CommitID, &job.Agent, &job.Status, &enqueuedAt,
 		&startedAt, &finishedAt, &workerID, &errMsg,

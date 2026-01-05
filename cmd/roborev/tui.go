@@ -115,9 +115,9 @@ func (m tuiModel) fetchStatus() tea.Cmd {
 	}
 }
 
-func (m tuiModel) fetchReview(sha string) tea.Cmd {
+func (m tuiModel) fetchReview(jobID int64) tea.Cmd {
 	return func() tea.Msg {
-		resp, err := http.Get(m.serverAddr + "/api/review?sha=" + sha)
+		resp, err := http.Get(fmt.Sprintf("%s/api/review?job_id=%d", m.serverAddr, jobID))
 		if err != nil {
 			return tuiErrMsg(err)
 		}
@@ -172,7 +172,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.currentView == tuiViewQueue && len(m.jobs) > 0 {
 				job := m.jobs[m.selectedIdx]
 				if job.Status == storage.JobStatusDone {
-					return m, m.fetchReview(job.CommitSHA)
+					return m, m.fetchReview(job.ID)
 				} else if job.Status == storage.JobStatusFailed {
 					// Show error inline for failed jobs
 					m.currentReview = &storage.Review{
@@ -247,12 +247,12 @@ func (m tuiModel) renderQueueView() string {
 	if len(m.jobs) == 0 {
 		b.WriteString("No jobs in queue\n")
 	} else {
-		// Header
-		header := fmt.Sprintf("%-4s %-7s %-15s %-12s %-8s %s",
+		// Header (with 2-char prefix to align with row selector)
+		header := fmt.Sprintf("  %-4s %-7s %-15s %-12s %-8s %s",
 			"ID", "SHA", "Repo", "Agent", "Status", "Time")
 		b.WriteString(tuiStatusStyle.Render(header))
 		b.WriteString("\n")
-		b.WriteString(strings.Repeat("-", min(m.width-2, 70)))
+		b.WriteString("  " + strings.Repeat("-", min(m.width-4, 68)))
 		b.WriteString("\n")
 
 		// Jobs
@@ -299,6 +299,7 @@ func (m tuiModel) renderJobLine(job storage.ReviewJob) string {
 		}
 	}
 
+	// Color the status, then pad to fixed width (lipgloss strips trailing spaces)
 	status := string(job.Status)
 	var styledStatus string
 	switch job.Status {
@@ -313,8 +314,13 @@ func (m tuiModel) renderJobLine(job storage.ReviewJob) string {
 	default:
 		styledStatus = status
 	}
+	// Pad after coloring since lipgloss strips trailing spaces
+	padding := 8 - len(status)
+	if padding > 0 {
+		styledStatus += strings.Repeat(" ", padding)
+	}
 
-	return fmt.Sprintf("%-4d %-7s %-15s %-12s %-8s %s",
+	return fmt.Sprintf("%-4d %-7s %-15s %-12s %s %s",
 		job.ID, sha, repo, agent, styledStatus, elapsed)
 }
 
