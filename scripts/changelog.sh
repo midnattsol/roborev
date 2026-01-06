@@ -1,0 +1,49 @@
+#!/bin/bash
+# Generate a changelog since the last release using codex
+# Usage: ./scripts/changelog.sh [version]
+# If version is not provided, uses "NEXT" as placeholder
+
+set -e
+
+VERSION="${1:-NEXT}"
+
+# Find the previous tag
+PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+if [ -z "$PREV_TAG" ]; then
+    # No previous tag, use first commit
+    RANGE="HEAD"
+    echo "No previous release found. Generating changelog for all commits..." >&2
+else
+    RANGE="$PREV_TAG..HEAD"
+    echo "Generating changelog from $PREV_TAG to HEAD..." >&2
+fi
+
+# Get commit log for changelog generation
+COMMITS=$(git log $RANGE --pretty=format:"- %s (%h)" --no-merges)
+DIFF_STAT=$(git diff --stat $PREV_TAG HEAD 2>/dev/null || git diff --stat $(git rev-list --max-parents=0 HEAD) HEAD)
+
+if [ -z "$COMMITS" ]; then
+    echo "No commits since $PREV_TAG" >&2
+    exit 0
+fi
+
+# Use codex to generate the changelog
+echo "Using codex to generate changelog..." >&2
+echo "" >&2
+
+codex -p "You are generating a changelog for roborev version $VERSION.
+
+Here are the commits since the last release:
+$COMMITS
+
+Here's the diff summary:
+$DIFF_STAT
+
+Please generate a concise, user-focused changelog. Group changes into sections like:
+- New Features
+- Improvements
+- Bug Fixes
+
+Focus on user-visible changes. Skip internal refactoring unless it affects users.
+Keep descriptions brief (one line each). Use present tense.
+Output ONLY the changelog content, no preamble."

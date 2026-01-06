@@ -9,6 +9,7 @@ import (
 func (db *DB) GetReviewByJobID(jobID int64) (*Review, error) {
 	var r Review
 	var createdAt string
+	var addressed int
 	var job ReviewJob
 	var enqueuedAt string
 	var startedAt, finishedAt, workerID, errMsg sql.NullString
@@ -16,7 +17,7 @@ func (db *DB) GetReviewByJobID(jobID int64) (*Review, error) {
 	var commitSubject sql.NullString
 
 	err := db.QueryRow(`
-		SELECT rv.id, rv.job_id, rv.agent, rv.prompt, rv.output, rv.created_at,
+		SELECT rv.id, rv.job_id, rv.agent, rv.prompt, rv.output, rv.created_at, rv.addressed,
 		       j.id, j.repo_id, j.commit_id, j.git_ref, j.agent, j.status, j.enqueued_at,
 		       j.started_at, j.finished_at, j.worker_id, j.error,
 		       rp.root_path, rp.name, c.subject
@@ -25,13 +26,14 @@ func (db *DB) GetReviewByJobID(jobID int64) (*Review, error) {
 		JOIN repos rp ON rp.id = j.repo_id
 		LEFT JOIN commits c ON c.id = j.commit_id
 		WHERE rv.job_id = ?
-	`, jobID).Scan(&r.ID, &r.JobID, &r.Agent, &r.Prompt, &r.Output, &createdAt,
+	`, jobID).Scan(&r.ID, &r.JobID, &r.Agent, &r.Prompt, &r.Output, &createdAt, &addressed,
 		&job.ID, &job.RepoID, &commitID, &job.GitRef, &job.Agent, &job.Status, &enqueuedAt,
 		&startedAt, &finishedAt, &workerID, &errMsg,
 		&job.RepoPath, &job.RepoName, &commitSubject)
 	if err != nil {
 		return nil, err
 	}
+	r.Addressed = addressed != 0
 
 	r.CreatedAt = parseSQLiteTime(createdAt)
 	if commitID.Valid {
@@ -64,6 +66,7 @@ func (db *DB) GetReviewByJobID(jobID int64) (*Review, error) {
 func (db *DB) GetReviewByCommitSHA(sha string) (*Review, error) {
 	var r Review
 	var createdAt string
+	var addressed int
 	var job ReviewJob
 	var enqueuedAt string
 	var startedAt, finishedAt, workerID, errMsg sql.NullString
@@ -72,7 +75,7 @@ func (db *DB) GetReviewByCommitSHA(sha string) (*Review, error) {
 
 	// Search by git_ref which contains the SHA for single commits
 	err := db.QueryRow(`
-		SELECT rv.id, rv.job_id, rv.agent, rv.prompt, rv.output, rv.created_at,
+		SELECT rv.id, rv.job_id, rv.agent, rv.prompt, rv.output, rv.created_at, rv.addressed,
 		       j.id, j.repo_id, j.commit_id, j.git_ref, j.agent, j.status, j.enqueued_at,
 		       j.started_at, j.finished_at, j.worker_id, j.error,
 		       rp.root_path, rp.name, c.subject
@@ -83,13 +86,14 @@ func (db *DB) GetReviewByCommitSHA(sha string) (*Review, error) {
 		WHERE j.git_ref = ?
 		ORDER BY rv.created_at DESC
 		LIMIT 1
-	`, sha).Scan(&r.ID, &r.JobID, &r.Agent, &r.Prompt, &r.Output, &createdAt,
+	`, sha).Scan(&r.ID, &r.JobID, &r.Agent, &r.Prompt, &r.Output, &createdAt, &addressed,
 		&job.ID, &job.RepoID, &commitID, &job.GitRef, &job.Agent, &job.Status, &enqueuedAt,
 		&startedAt, &finishedAt, &workerID, &errMsg,
 		&job.RepoPath, &job.RepoName, &commitSubject)
 	if err != nil {
 		return nil, err
 	}
+	r.Addressed = addressed != 0
 
 	if commitID.Valid {
 		job.CommitID = &commitID.Int64
@@ -122,7 +126,7 @@ func (db *DB) GetReviewByCommitSHA(sha string) (*Review, error) {
 // GetRecentReviewsForRepo returns the N most recent reviews for a repo
 func (db *DB) GetRecentReviewsForRepo(repoID int64, limit int) ([]Review, error) {
 	rows, err := db.Query(`
-		SELECT rv.id, rv.job_id, rv.agent, rv.prompt, rv.output, rv.created_at
+		SELECT rv.id, rv.job_id, rv.agent, rv.prompt, rv.output, rv.created_at, rv.addressed
 		FROM reviews rv
 		JOIN review_jobs j ON j.id = rv.job_id
 		WHERE j.repo_id = ?
@@ -138,14 +142,45 @@ func (db *DB) GetRecentReviewsForRepo(repoID int64, limit int) ([]Review, error)
 	for rows.Next() {
 		var r Review
 		var createdAt string
-		if err := rows.Scan(&r.ID, &r.JobID, &r.Agent, &r.Prompt, &r.Output, &createdAt); err != nil {
+		var addressed int
+		if err := rows.Scan(&r.ID, &r.JobID, &r.Agent, &r.Prompt, &r.Output, &createdAt, &addressed); err != nil {
 			return nil, err
 		}
 		r.CreatedAt = parseSQLiteTime(createdAt)
+		r.Addressed = addressed != 0
 		reviews = append(reviews, r)
 	}
 
 	return reviews, rows.Err()
+}
+
+// MarkReviewAddressed marks a review as addressed (or unaddressed)
+func (db *DB) MarkReviewAddressed(reviewID int64, addressed bool) error {
+	val := 0
+	if addressed {
+		val = 1
+	}
+	_, err := db.Exec(`UPDATE reviews SET addressed = ? WHERE id = ?`, val, reviewID)
+	return err
+}
+
+// GetReviewByID finds a review by its ID
+func (db *DB) GetReviewByID(reviewID int64) (*Review, error) {
+	var r Review
+	var createdAt string
+	var addressed int
+
+	err := db.QueryRow(`
+		SELECT id, job_id, agent, prompt, output, created_at, addressed
+		FROM reviews WHERE id = ?
+	`, reviewID).Scan(&r.ID, &r.JobID, &r.Agent, &r.Prompt, &r.Output, &createdAt, &addressed)
+	if err != nil {
+		return nil, err
+	}
+	r.CreatedAt = parseSQLiteTime(createdAt)
+	r.Addressed = addressed != 0
+
+	return &r, nil
 }
 
 // AddResponse adds a response to a commit

@@ -55,6 +55,7 @@ type Review struct {
 	Prompt    string    `json:"prompt"`
 	Output    string    `json:"output"`
 	CreatedAt time.Time `json:"created_at"`
+	Addressed bool      `json:"addressed"`
 
 	// Joined fields
 	Job *ReviewJob `json:"job,omitempty"`

@@ -35,6 +35,7 @@ func NewServer(db *storage.DB, cfg *config.Config) *Server {
 	mux.HandleFunc("/api/enqueue", s.handleEnqueue)
 	mux.HandleFunc("/api/jobs", s.handleListJobs)
 	mux.HandleFunc("/api/review", s.handleGetReview)
+	mux.HandleFunc("/api/review/address", s.handleAddressReview)
 	mux.HandleFunc("/api/respond", s.handleAddResponse)
 	mux.HandleFunc("/api/responses", s.handleListResponses)
 	mux.HandleFunc("/api/status", s.handleStatus)
@@ -352,4 +353,34 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, status)
+}
+
+type AddressReviewRequest struct {
+	ReviewID  int64 `json:"review_id"`
+	Addressed bool  `json:"addressed"`
+}
+
+func (s *Server) handleAddressReview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req AddressReviewRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.ReviewID == 0 {
+		writeError(w, http.StatusBadRequest, "review_id is required")
+		return
+	}
+
+	if err := s.db.MarkReviewAddressed(req.ReviewID, req.Addressed); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("mark addressed: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 }

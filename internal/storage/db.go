@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS reviews (
   agent TEXT NOT NULL,
   prompt TEXT NOT NULL,
   output TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  addressed INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS responses (
@@ -109,7 +110,6 @@ func Open(dbPath string) (*DB, error) {
 // migrate runs any needed migrations for existing databases
 func (db *DB) migrate() error {
 	// Migration: add prompt column to review_jobs if missing
-	// Check if column exists by querying pragma
 	var count int
 	err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = 'prompt'`).Scan(&count)
 	if err != nil {
@@ -121,6 +121,19 @@ func (db *DB) migrate() error {
 			return fmt.Errorf("add prompt column: %w", err)
 		}
 	}
+
+	// Migration: add addressed column to reviews if missing
+	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('reviews') WHERE name = 'addressed'`).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("check addressed column: %w", err)
+	}
+	if count == 0 {
+		_, err = db.Exec(`ALTER TABLE reviews ADD COLUMN addressed INTEGER NOT NULL DEFAULT 0`)
+		if err != nil {
+			return fmt.Errorf("add addressed column: %w", err)
+		}
+	}
+
 	return nil
 }
 

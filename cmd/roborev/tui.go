@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -68,6 +69,7 @@ type tuiJobsMsg []storage.ReviewJob
 type tuiStatusMsg storage.DaemonStatus
 type tuiReviewMsg *storage.Review
 type tuiPromptMsg *storage.Review
+type tuiAddressedMsg bool
 type tuiErrMsg error
 
 func newTuiModel(serverAddr string) tuiModel {
@@ -173,6 +175,25 @@ func (m tuiModel) fetchReviewForPrompt(jobID int64) tea.Cmd {
 			return tuiErrMsg(err)
 		}
 		return tuiPromptMsg(&review)
+	}
+}
+
+func (m tuiModel) addressReview(reviewID int64, addressed bool) tea.Cmd {
+	return func() tea.Msg {
+		reqBody, _ := json.Marshal(map[string]interface{}{
+			"review_id": reviewID,
+			"addressed": addressed,
+		})
+		resp, err := http.Post(m.serverAddr+"/api/review/address", "application/json", bytes.NewReader(reqBody))
+		if err != nil {
+			return tuiErrMsg(err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return tuiErrMsg(fmt.Errorf("failed to mark review"))
+		}
+		return tuiAddressedMsg(addressed)
 	}
 }
 
@@ -304,6 +325,13 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
+		case "a":
+			// Toggle addressed status for current review
+			if m.currentView == tuiViewReview && m.currentReview != nil && m.currentReview.ID > 0 {
+				newState := !m.currentReview.Addressed
+				return m, m.addressReview(m.currentReview.ID, newState)
+			}
+
 		case "esc":
 			if m.currentView == tuiViewReview {
 				m.currentView = tuiViewQueue
@@ -350,6 +378,11 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.currentReview = msg
 		m.currentView = tuiViewPrompt
 		m.promptScroll = 0
+
+	case tuiAddressedMsg:
+		if m.currentReview != nil {
+			m.currentReview.Addressed = bool(msg)
+		}
 
 	case tuiErrMsg:
 		m.err = msg
@@ -540,7 +573,11 @@ func (m tuiModel) renderReviewView() string {
 	review := m.currentReview
 	if review.Job != nil {
 		ref := shortRef(review.Job.GitRef)
-		title := fmt.Sprintf("Review: %s (%s)", ref, review.Agent)
+		addressedStr := ""
+		if review.Addressed {
+			addressedStr = " [ADDRESSED]"
+		}
+		title := fmt.Sprintf("Review: %s (%s)%s", ref, review.Agent, addressedStr)
 		b.WriteString(tuiTitleStyle.Render(title))
 	} else {
 		b.WriteString(tuiTitleStyle.Render("Review"))
@@ -571,7 +608,7 @@ func (m tuiModel) renderReviewView() string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString(tuiHelpStyle.Render("up/down: scroll | p: view prompt | esc/q: back"))
+	b.WriteString(tuiHelpStyle.Render("up/down: scroll | a: toggle addressed | p: view prompt | esc/q: back"))
 
 	return b.String()
 }

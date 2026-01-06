@@ -42,6 +42,7 @@ func main() {
 	rootCmd.AddCommand(statusCmd())
 	rootCmd.AddCommand(showCmd())
 	rootCmd.AddCommand(respondCmd())
+	rootCmd.AddCommand(addressCmd())
 	rootCmd.AddCommand(installHookCmd())
 	rootCmd.AddCommand(daemonCmd())
 	rootCmd.AddCommand(tuiCmd())
@@ -628,6 +629,56 @@ func respondCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&responder, "responder", "", "responder name (default: $USER)")
 	cmd.Flags().StringVarP(&message, "message", "m", "", "response message (opens editor if not provided)")
+
+	return cmd
+}
+
+func addressCmd() *cobra.Command {
+	var unaddress bool
+
+	cmd := &cobra.Command{
+		Use:   "address <review_id>",
+		Short: "Mark a review as addressed",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Ensure daemon is running
+			if err := ensureDaemon(); err != nil {
+				return fmt.Errorf("daemon not running: %w", err)
+			}
+
+			var reviewID int64
+			if _, err := fmt.Sscanf(args[0], "%d", &reviewID); err != nil {
+				return fmt.Errorf("invalid review_id: %s", args[0])
+			}
+
+			addressed := !unaddress
+			reqBody, _ := json.Marshal(map[string]interface{}{
+				"review_id": reviewID,
+				"addressed": addressed,
+			})
+
+			addr := getDaemonAddr()
+			resp, err := http.Post(addr+"/api/review/address", "application/json", bytes.NewReader(reqBody))
+			if err != nil {
+				return fmt.Errorf("failed to connect to daemon: %w", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				return fmt.Errorf("failed to mark review: %s", body)
+			}
+
+			if addressed {
+				fmt.Printf("Review %d marked as addressed\n", reviewID)
+			} else {
+				fmt.Printf("Review %d marked as unaddressed\n", reviewID)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVar(&unaddress, "unaddress", false, "mark as unaddressed instead")
 
 	return cmd
 }
