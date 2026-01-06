@@ -47,31 +47,50 @@ func (db *DB) EnqueueRangeJob(repoID int64, gitRef, agent string) (*ReviewJob, e
 
 // ClaimJob atomically claims the next queued job for a worker
 func (db *DB) ClaimJob(workerID string) (*ReviewJob, error) {
-	tx, err := db.Begin()
+	now := time.Now()
+	nowStr := now.Format(time.RFC3339)
+
+	// Atomically claim a job by updating it in a single statement
+	// This prevents race conditions where two workers select the same job
+	result, err := db.Exec(`
+		UPDATE review_jobs
+		SET status = 'running', worker_id = ?, started_at = ?
+		WHERE id = (
+			SELECT id FROM review_jobs
+			WHERE status = 'queued'
+			ORDER BY enqueued_at
+			LIMIT 1
+		)
+	`, workerID, nowStr)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
 
-	// Find and lock the next queued job
+	// Check if we claimed anything
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if rowsAffected == 0 {
+		return nil, nil // No jobs available
+	}
+
+	// Now fetch the job we just claimed
 	var job ReviewJob
 	var enqueuedAt string
 	var commitID sql.NullInt64
 	var commitSubject sql.NullString
-	err = tx.QueryRow(`
+	err = db.QueryRow(`
 		SELECT j.id, j.repo_id, j.commit_id, j.git_ref, j.agent, j.status, j.enqueued_at,
 		       r.root_path, r.name, c.subject
 		FROM review_jobs j
 		JOIN repos r ON r.id = j.repo_id
 		LEFT JOIN commits c ON c.id = j.commit_id
-		WHERE j.status = 'queued'
-		ORDER BY j.enqueued_at
+		WHERE j.worker_id = ? AND j.status = 'running'
+		ORDER BY j.started_at DESC
 		LIMIT 1
-	`).Scan(&job.ID, &job.RepoID, &commitID, &job.GitRef, &job.Agent, &job.Status, &enqueuedAt,
+	`, workerID).Scan(&job.ID, &job.RepoID, &commitID, &job.GitRef, &job.Agent, &job.Status, &enqueuedAt,
 		&job.RepoPath, &job.RepoName, &commitSubject)
-	if err == sql.ErrNoRows {
-		return nil, nil // No jobs available
-	}
 	if err != nil {
 		return nil, err
 	}
@@ -83,19 +102,6 @@ func (db *DB) ClaimJob(workerID string) (*ReviewJob, error) {
 		job.CommitSubject = commitSubject.String
 	}
 	job.EnqueuedAt, _ = time.Parse(time.RFC3339, enqueuedAt)
-
-	// Claim it
-	now := time.Now()
-	_, err = tx.Exec(`UPDATE review_jobs SET status = 'running', worker_id = ?, started_at = ? WHERE id = ?`,
-		workerID, now.Format(time.RFC3339), job.ID)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-
 	job.Status = JobStatusRunning
 	job.WorkerID = workerID
 	job.StartedAt = &now

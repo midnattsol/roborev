@@ -109,16 +109,22 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		return
 	}
 
-	// Get the agent
-	a, err := agent.Get(job.Agent)
+	// Get the agent (falls back to available agent if preferred not installed)
+	a, err := agent.GetAvailable(job.Agent)
 	if err != nil {
-		log.Printf("[%s] Error getting agent %s: %v", workerID, job.Agent, err)
+		log.Printf("[%s] Error getting agent: %v", workerID, err)
 		wp.db.FailJob(job.ID, fmt.Sprintf("get agent: %v", err))
 		return
 	}
 
+	// Use the actual agent name (may differ from requested if fallback occurred)
+	agentName := a.Name()
+	if agentName != job.Agent {
+		log.Printf("[%s] Agent %s not available, using %s", workerID, job.Agent, agentName)
+	}
+
 	// Run the review
-	log.Printf("[%s] Running %s review...", workerID, job.Agent)
+	log.Printf("[%s] Running %s review...", workerID, agentName)
 	output, err := a.Review(ctx, job.RepoPath, job.GitRef, reviewPrompt)
 	if err != nil {
 		log.Printf("[%s] Agent error: %v", workerID, err)
@@ -126,8 +132,8 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		return
 	}
 
-	// Store the result
-	if err := wp.db.CompleteJob(job.ID, job.Agent, reviewPrompt, output); err != nil {
+	// Store the result (use actual agent name, not requested)
+	if err := wp.db.CompleteJob(job.ID, agentName, reviewPrompt, output); err != nil {
 		log.Printf("[%s] Error storing review: %v", workerID, err)
 		return
 	}

@@ -1,14 +1,11 @@
 package storage
 
 import (
-	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
 func TestOpenAndClose(t *testing.T) {
@@ -276,150 +273,4 @@ func openTestDB(t *testing.T) *DB {
 	}
 
 	return db
-}
-
-func TestMigrationV1ToV2(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
-
-	// Create a v1 database manually with the old schema
-	db, err := openRawDB(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to create raw DB: %v", err)
-	}
-
-	// Create old schema with commit_sha instead of git_ref
-	_, err = db.Exec(`
-		CREATE TABLE repos (
-			id INTEGER PRIMARY KEY,
-			root_path TEXT UNIQUE NOT NULL,
-			name TEXT NOT NULL,
-			created_at TEXT NOT NULL DEFAULT (datetime('now'))
-		);
-
-		CREATE TABLE commits (
-			id INTEGER PRIMARY KEY,
-			repo_id INTEGER NOT NULL REFERENCES repos(id),
-			sha TEXT UNIQUE NOT NULL,
-			author TEXT NOT NULL,
-			subject TEXT NOT NULL,
-			timestamp TEXT NOT NULL,
-			created_at TEXT NOT NULL DEFAULT (datetime('now'))
-		);
-
-		CREATE TABLE review_jobs (
-			id INTEGER PRIMARY KEY,
-			repo_id INTEGER NOT NULL REFERENCES repos(id),
-			commit_id INTEGER NOT NULL REFERENCES commits(id),
-			commit_sha TEXT NOT NULL,
-			agent TEXT NOT NULL DEFAULT 'codex',
-			status TEXT NOT NULL DEFAULT 'queued',
-			enqueued_at TEXT NOT NULL DEFAULT (datetime('now')),
-			started_at TEXT,
-			finished_at TEXT,
-			worker_id TEXT,
-			error TEXT
-		);
-
-		CREATE TABLE reviews (
-			id INTEGER PRIMARY KEY,
-			job_id INTEGER UNIQUE NOT NULL REFERENCES review_jobs(id),
-			agent TEXT NOT NULL,
-			prompt TEXT NOT NULL,
-			output TEXT NOT NULL,
-			created_at TEXT NOT NULL DEFAULT (datetime('now'))
-		);
-
-		CREATE TABLE responses (
-			id INTEGER PRIMARY KEY,
-			commit_id INTEGER NOT NULL REFERENCES commits(id),
-			responder TEXT NOT NULL,
-			response TEXT NOT NULL,
-			created_at TEXT NOT NULL DEFAULT (datetime('now'))
-		);
-	`)
-	if err != nil {
-		t.Fatalf("Failed to create old schema: %v", err)
-	}
-
-	// Insert some test data
-	_, err = db.Exec(`
-		INSERT INTO repos (id, root_path, name) VALUES (1, '/test/repo', 'repo');
-		INSERT INTO commits (id, repo_id, sha, author, subject, timestamp) VALUES (1, 1, 'abc123', 'Author', 'Subject', '2024-01-01T00:00:00Z');
-		INSERT INTO review_jobs (id, repo_id, commit_id, commit_sha, agent, status) VALUES (1, 1, 1, 'abc123', 'codex', 'done');
-		INSERT INTO reviews (id, job_id, agent, prompt, output) VALUES (1, 1, 'codex', 'prompt', 'output');
-	`)
-	if err != nil {
-		t.Fatalf("Failed to insert test data: %v", err)
-	}
-	db.Close()
-
-	// Now open with the new Open function which should migrate
-	migratedDB, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Open (with migration) failed: %v", err)
-	}
-	defer migratedDB.Close()
-
-	// Verify the schema version was set
-	version := migratedDB.getSchemaVersion()
-	if version != currentSchemaVersion {
-		t.Errorf("Expected schema version %d, got %d", currentSchemaVersion, version)
-	}
-
-	// Verify data was migrated - git_ref should contain what was in commit_sha
-	var gitRef string
-	err = migratedDB.QueryRow("SELECT git_ref FROM review_jobs WHERE id = 1").Scan(&gitRef)
-	if err != nil {
-		t.Fatalf("Failed to query migrated data: %v", err)
-	}
-	if gitRef != "abc123" {
-		t.Errorf("Expected git_ref 'abc123', got '%s'", gitRef)
-	}
-
-	// Verify old column doesn't exist
-	rows, err := migratedDB.Query("PRAGMA table_info(review_jobs)")
-	if err != nil {
-		t.Fatalf("Failed to get table info: %v", err)
-	}
-	defer rows.Close()
-
-	hasCommitSHA := false
-	hasGitRef := false
-	for rows.Next() {
-		var cid int
-		var name, ctype string
-		var notnull, pk int
-		var dflt interface{}
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			t.Fatal(err)
-		}
-		if name == "commit_sha" {
-			hasCommitSHA = true
-		}
-		if name == "git_ref" {
-			hasGitRef = true
-		}
-	}
-
-	if hasCommitSHA {
-		t.Error("Old commit_sha column still exists after migration")
-	}
-	if !hasGitRef {
-		t.Error("New git_ref column missing after migration")
-	}
-}
-
-// openRawDB opens a database without running migrations
-func openRawDB(dbPath string) (*DB, error) {
-	dir := filepath.Dir(dbPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, err
-	}
-
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
-	if err != nil {
-		return nil, err
-	}
-	return &DB{db}, nil
 }

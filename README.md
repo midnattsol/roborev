@@ -86,14 +86,39 @@ The daemon starts automatically when needed and handles port conflicts by findin
 
 ## Agents
 
+roborev supports multiple AI review agents:
+
 - `codex` - OpenAI Codex CLI
 - `claude-code` - Anthropic Claude Code CLI
 
-Agent selection priority:
-1. `--agent` flag on enqueue
+### Automatic Fallback
+
+roborev automatically detects which agents are installed and falls back gracefully:
+
+- If `codex` is requested but not installed, roborev uses `claude` instead
+- If `claude-code` is requested but not installed, roborev uses `codex` instead
+- If neither is installed, the job fails with a helpful error message
+
+### Explicit Agent Selection
+
+To use a specific agent for a repository, create `.roborev.toml` in the repo root:
+
+```toml
+agent = "claude-code"
+```
+
+Or set a global default in `~/.roborev/config.toml`:
+
+```toml
+default_agent = "claude-code"
+```
+
+### Selection Priority
+
+1. `--agent` flag on enqueue command
 2. Per-repo `.roborev.toml`
-3. Global config
-4. Default: `codex`
+3. Global `~/.roborev/config.toml`
+4. Automatic detection (uses first available: codex, claude-code)
 
 ## Commands
 

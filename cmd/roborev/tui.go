@@ -316,10 +316,7 @@ func (m tuiModel) renderQueueView() string {
 }
 
 func (m tuiModel) renderJobLine(job storage.ReviewJob) string {
-	ref := job.GitRef
-	if len(ref) > 17 {
-		ref = ref[:17]
-	}
+	ref := shortRef(job.GitRef)
 
 	repo := job.RepoName
 	if len(repo) > 15 {
@@ -406,10 +403,7 @@ func (m tuiModel) renderReviewView() string {
 
 	review := m.currentReview
 	if review.Job != nil {
-		ref := review.Job.GitRef
-		if len(ref) > 17 {
-			ref = ref[:17]
-		}
+		ref := shortRef(review.Job.GitRef)
 		title := fmt.Sprintf("Review: %s (%s)", ref, review.Agent)
 		b.WriteString(tuiTitleStyle.Render(title))
 	} else {

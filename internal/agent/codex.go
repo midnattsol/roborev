@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 )
 
 // CodexAgent runs code reviews using the Codex CLI
@@ -26,10 +25,18 @@ func (a *CodexAgent) Name() string {
 	return "codex"
 }
 
+func (a *CodexAgent) CommandName() string {
+	return a.Command
+}
+
 func (a *CodexAgent) Review(ctx context.Context, repoPath, commitSHA, prompt string) (string, error) {
-	// Create temp file for output
-	tmpDir := os.TempDir()
-	outputFile := filepath.Join(tmpDir, fmt.Sprintf("roborev-%s.txt", commitSHA[:8]))
+	// Create unique temp file for output
+	tmpFile, err := os.CreateTemp("", "roborev-*.txt")
+	if err != nil {
+		return "", fmt.Errorf("create temp file: %w", err)
+	}
+	outputFile := tmpFile.Name()
+	tmpFile.Close()
 	defer os.Remove(outputFile)
 
 	// Use codex exec with output capture

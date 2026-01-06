@@ -355,9 +355,10 @@ func statusCmd() *cobra.Command {
 		Use:   "status",
 		Short: "Show daemon and queue status",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Check if daemon is running
+			// Check if daemon is running (use runtime file to find actual port)
+			addr := getDaemonAddr()
 			client := &http.Client{Timeout: 2 * time.Second}
-			resp, err := client.Get(serverAddr + "/api/status")
+			resp, err := client.Get(addr + "/api/status")
 			if err != nil {
 				fmt.Println("Daemon: not running")
 				fmt.Println()
@@ -378,7 +379,7 @@ func statusCmd() *cobra.Command {
 			fmt.Println()
 
 			// Get recent jobs
-			resp, err = client.Get(serverAddr + "/api/jobs?limit=10")
+			resp, err = client.Get(addr + "/api/jobs?limit=10")
 			if err != nil {
 				return nil
 			}
@@ -433,8 +434,9 @@ func showCmd() *cobra.Command {
 				}
 			}
 
+			addr := getDaemonAddr()
 			client := &http.Client{Timeout: 5 * time.Second}
-			resp, err := client.Get(serverAddr + "/api/review?sha=" + sha)
+			resp, err := client.Get(addr + "/api/review?sha=" + sha)
 			if err != nil {
 				return fmt.Errorf("failed to connect to daemon (is it running?)")
 			}
@@ -524,7 +526,8 @@ func respondCmd() *cobra.Command {
 				"response":  message,
 			})
 
-			resp, err := http.Post(serverAddr+"/api/respond", "application/json", bytes.NewReader(reqBody))
+			addr := getDaemonAddr()
+			resp, err := http.Post(addr+"/api/respond", "application/json", bytes.NewReader(reqBody))
 			if err != nil {
 				return fmt.Errorf("failed to connect to daemon: %w", err)
 			}

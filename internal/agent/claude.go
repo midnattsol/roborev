@@ -24,6 +24,10 @@ func (a *ClaudeAgent) Name() string {
 	return "claude-code"
 }
 
+func (a *ClaudeAgent) CommandName() string {
+	return a.Command
+}
+
 func (a *ClaudeAgent) Review(ctx context.Context, repoPath, commitSHA, prompt string) (string, error) {
 	// Use claude CLI in print mode (non-interactive)
 	// --print outputs the response without the interactive TUI

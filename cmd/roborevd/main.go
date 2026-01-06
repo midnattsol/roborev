@@ -24,8 +24,8 @@ func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 	log.Println("Starting roborevd...")
 
-	// Load configuration
-	cfg, err := config.LoadGlobal()
+	// Load configuration from specified path
+	cfg, err := config.LoadGlobalFrom(*configPath)
 	if err != nil {
 		log.Printf("Warning: failed to load config from %s: %v", *configPath, err)
 		cfg = config.DefaultConfig()

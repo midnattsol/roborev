@@ -43,11 +43,15 @@ func GlobalConfigPath() string {
 	return filepath.Join(home, ".roborev", "config.toml")
 }
 
-// LoadGlobal loads the global configuration, using defaults for missing values
+// LoadGlobal loads the global configuration from the default path
 func LoadGlobal() (*Config, error) {
+	return LoadGlobalFrom(GlobalConfigPath())
+}
+
+// LoadGlobalFrom loads the global configuration from a specific path
+func LoadGlobalFrom(path string) (*Config, error) {
 	cfg := DefaultConfig()
 
-	path := GlobalConfigPath()
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return cfg, nil
 	}

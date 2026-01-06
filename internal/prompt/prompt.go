@@ -8,6 +8,10 @@ import (
 	"github.com/wesm/roborev/internal/storage"
 )
 
+// MaxPromptSize is the maximum size of a prompt in bytes (250KB)
+// If the prompt with diffs exceeds this, we fall back to just commit info
+const MaxPromptSize = 250 * 1024
+
 // SystemPromptSingle is the base instruction for single commit reviews
 const SystemPromptSingle = `You are a code reviewer. Review the git commit shown below for:
 
@@ -102,8 +106,43 @@ func (b *Builder) buildSinglePrompt(repoPath, sha string, repoID int64, contextC
 	if len(shortSHA) > 7 {
 		shortSHA = shortSHA[:7]
 	}
+
+	// Get commit info
+	info, err := git.GetCommitInfo(repoPath, sha)
+	if err != nil {
+		return "", fmt.Errorf("get commit info: %w", err)
+	}
+
 	sb.WriteString("## Current Commit\n\n")
-	sb.WriteString(fmt.Sprintf("Review the following commit: %s\n", shortSHA))
+	sb.WriteString(fmt.Sprintf("**Commit:** %s\n", shortSHA))
+	sb.WriteString(fmt.Sprintf("**Author:** %s\n", info.Author))
+	sb.WriteString(fmt.Sprintf("**Subject:** %s\n\n", info.Subject))
+
+	// Get and include the diff
+	diff, err := git.GetDiff(repoPath, sha)
+	if err != nil {
+		return "", fmt.Errorf("get diff: %w", err)
+	}
+
+	// Build diff section
+	var diffSection strings.Builder
+	diffSection.WriteString("### Diff\n\n")
+	diffSection.WriteString("```diff\n")
+	diffSection.WriteString(diff)
+	if !strings.HasSuffix(diff, "\n") {
+		diffSection.WriteString("\n")
+	}
+	diffSection.WriteString("```\n")
+
+	// Check if adding the diff would exceed max prompt size
+	if sb.Len()+diffSection.Len() > MaxPromptSize {
+		// Fall back to just commit info without diff
+		sb.WriteString("### Diff\n\n")
+		sb.WriteString("(Diff too large to include - please review the commit directly)\n")
+		sb.WriteString(fmt.Sprintf("View with: git show %s\n", sha))
+	} else {
+		sb.WriteString(diffSection.String())
+	}
 
 	return sb.String(), nil
 }
@@ -150,6 +189,32 @@ func (b *Builder) buildRangePrompt(repoPath, rangeRef string, repoID int64, cont
 		}
 	}
 	sb.WriteString("\n")
+
+	// Get and include the combined diff for the range
+	diff, err := git.GetRangeDiff(repoPath, rangeRef)
+	if err != nil {
+		return "", fmt.Errorf("get range diff: %w", err)
+	}
+
+	// Build diff section
+	var diffSection strings.Builder
+	diffSection.WriteString("### Combined Diff\n\n")
+	diffSection.WriteString("```diff\n")
+	diffSection.WriteString(diff)
+	if !strings.HasSuffix(diff, "\n") {
+		diffSection.WriteString("\n")
+	}
+	diffSection.WriteString("```\n")
+
+	// Check if adding the diff would exceed max prompt size
+	if sb.Len()+diffSection.Len() > MaxPromptSize {
+		// Fall back to just commit info without diff
+		sb.WriteString("### Combined Diff\n\n")
+		sb.WriteString("(Diff too large to include - please review the commits directly)\n")
+		sb.WriteString(fmt.Sprintf("View with: git diff %s\n", rangeRef))
+	} else {
+		sb.WriteString(diffSection.String())
+	}
 
 	return sb.String(), nil
 }
