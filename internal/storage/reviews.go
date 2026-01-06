@@ -160,8 +160,18 @@ func (db *DB) MarkReviewAddressed(reviewID int64, addressed bool) error {
 	if addressed {
 		val = 1
 	}
-	_, err := db.Exec(`UPDATE reviews SET addressed = ? WHERE id = ?`, val, reviewID)
-	return err
+	result, err := db.Exec(`UPDATE reviews SET addressed = ? WHERE id = ?`, val, reviewID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // GetReviewByID finds a review by its ID

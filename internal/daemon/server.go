@@ -378,6 +378,10 @@ func (s *Server) handleAddressReview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.db.MarkReviewAddressed(req.ReviewID, req.Addressed); err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			writeError(w, http.StatusNotFound, "review not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("mark addressed: %v", err))
 		return
 	}

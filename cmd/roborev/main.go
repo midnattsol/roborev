@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -646,8 +647,8 @@ func addressCmd() *cobra.Command {
 				return fmt.Errorf("daemon not running: %w", err)
 			}
 
-			var reviewID int64
-			if _, err := fmt.Sscanf(args[0], "%d", &reviewID); err != nil {
+			reviewID, err := strconv.ParseInt(args[0], 10, 64)
+			if err != nil || reviewID <= 0 {
 				return fmt.Errorf("invalid review_id: %s", args[0])
 			}
 

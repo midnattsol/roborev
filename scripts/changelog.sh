@@ -11,7 +11,8 @@ VERSION="${1:-NEXT}"
 PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
 if [ -z "$PREV_TAG" ]; then
     # No previous tag, use first commit
-    RANGE="HEAD"
+    FIRST_COMMIT=$(git rev-list --max-parents=0 HEAD)
+    RANGE="$FIRST_COMMIT..HEAD"
     echo "No previous release found. Generating changelog for all commits..." >&2
 else
     RANGE="$PREV_TAG..HEAD"
@@ -20,7 +21,7 @@ fi
 
 # Get commit log for changelog generation
 COMMITS=$(git log $RANGE --pretty=format:"- %s (%h)" --no-merges)
-DIFF_STAT=$(git diff --stat $PREV_TAG HEAD 2>/dev/null || git diff --stat $(git rev-list --max-parents=0 HEAD) HEAD)
+DIFF_STAT=$(git diff --stat $RANGE)
 
 if [ -z "$COMMITS" ]; then
     echo "No commits since $PREV_TAG" >&2
