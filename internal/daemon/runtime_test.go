@@ -28,7 +28,7 @@ func TestRuntimeInfoReadWrite(t *testing.T) {
 	defer os.Setenv("HOME", origHome)
 
 	// Write runtime info
-	err := WriteRuntime("127.0.0.1:7373", 7373)
+	err := WriteRuntime("127.0.0.1:7373", 7373, "test-version")
 	if err != nil {
 		t.Fatalf("WriteRuntime failed: %v", err)
 	}
@@ -47,6 +47,9 @@ func TestRuntimeInfoReadWrite(t *testing.T) {
 	}
 	if info.PID == 0 {
 		t.Error("Expected non-zero PID")
+	}
+	if info.Version != "test-version" {
+		t.Errorf("Expected version 'test-version', got '%s'", info.Version)
 	}
 
 	// Remove it

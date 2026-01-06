@@ -12,9 +12,10 @@ import (
 
 // RuntimeInfo stores daemon runtime state
 type RuntimeInfo struct {
-	PID  int    `json:"pid"`
-	Addr string `json:"addr"`
-	Port int    `json:"port"`
+	PID     int    `json:"pid"`
+	Addr    string `json:"addr"`
+	Port    int    `json:"port"`
+	Version string `json:"version"`
 }
 
 // RuntimePath returns the path to the runtime info file
@@ -24,11 +25,12 @@ func RuntimePath() string {
 }
 
 // WriteRuntime saves the daemon runtime info
-func WriteRuntime(addr string, port int) error {
+func WriteRuntime(addr string, port int, version string) error {
 	info := RuntimeInfo{
-		PID:  os.Getpid(),
-		Addr: addr,
-		Port: port,
+		PID:     os.Getpid(),
+		Addr:    addr,
+		Port:    port,
+		Version: version,
 	}
 
 	path := RuntimePath()

@@ -11,6 +11,7 @@ import (
 
 	"github.com/wesm/roborev/internal/daemon"
 	"github.com/wesm/roborev/internal/storage"
+	"github.com/wesm/roborev/internal/version"
 )
 
 func TestEnqueueCmdPositionalArg(t *testing.T) {
@@ -99,7 +100,7 @@ func TestEnqueueCmdPositionalArg(t *testing.T) {
 	os.MkdirAll(roborevDir, 0755)
 	// Extract host:port from ts.URL (strip http://)
 	mockAddr := ts.URL[7:] // remove "http://"
-	daemonInfo := daemon.RuntimeInfo{Addr: mockAddr, PID: os.Getpid()}
+	daemonInfo := daemon.RuntimeInfo{Addr: mockAddr, PID: os.Getpid(), Version: version.Version}
 	data, _ := json.Marshal(daemonInfo)
 	os.WriteFile(filepath.Join(roborevDir, "daemon.json"), data, 0644)
 

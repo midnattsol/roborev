@@ -19,6 +19,7 @@ import (
 	"github.com/wesm/roborev/internal/daemon"
 	"github.com/wesm/roborev/internal/git"
 	"github.com/wesm/roborev/internal/storage"
+	"github.com/wesm/roborev/internal/version"
 )
 
 var (
@@ -44,6 +45,7 @@ func main() {
 	rootCmd.AddCommand(installHookCmd())
 	rootCmd.AddCommand(daemonCmd())
 	rootCmd.AddCommand(tuiCmd())
+	rootCmd.AddCommand(versionCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -59,15 +61,25 @@ func getDaemonAddr() string {
 }
 
 // ensureDaemon checks if daemon is running, starts it if not
+// If daemon is running but has different version, restart it
 func ensureDaemon() error {
 	client := &http.Client{Timeout: 500 * time.Millisecond}
 
-	// First check runtime file for daemon address
+	// First check runtime file for daemon address and version
 	if info, err := daemon.ReadRuntime(); err == nil {
 		addr := fmt.Sprintf("http://%s/api/status", info.Addr)
 		resp, err := client.Get(addr)
 		if err == nil {
 			resp.Body.Close()
+
+			// Check version match
+			if info.Version != version.Version {
+				if verbose {
+					fmt.Printf("Daemon version mismatch (daemon: %s, cli: %s), restarting...\n", info.Version, version.Version)
+				}
+				return restartDaemon()
+			}
+
 			serverAddr = fmt.Sprintf("http://%s", info.Addr)
 			return nil
 		}
@@ -81,6 +93,11 @@ func ensureDaemon() error {
 	}
 
 	// Start daemon in background
+	return startDaemon()
+}
+
+// startDaemon starts a new daemon process
+func startDaemon() error {
 	if verbose {
 		fmt.Println("Starting daemon...")
 	}
@@ -99,6 +116,7 @@ func ensureDaemon() error {
 	}
 
 	// Wait for daemon to be ready and update serverAddr from runtime file
+	client := &http.Client{Timeout: 500 * time.Millisecond}
 	for i := 0; i < 30; i++ {
 		time.Sleep(100 * time.Millisecond)
 		if info, err := daemon.ReadRuntime(); err == nil {
@@ -113,6 +131,17 @@ func ensureDaemon() error {
 	}
 
 	return fmt.Errorf("daemon failed to start")
+}
+
+// restartDaemon stops the running daemon and starts a new one
+func restartDaemon() error {
+	if runtime.GOOS == "windows" {
+		exec.Command("taskkill", "/IM", "roborevd.exe", "/F").Run()
+	} else {
+		exec.Command("pkill", "-f", "roborevd").Run()
+	}
+	time.Sleep(500 * time.Millisecond)
+	return startDaemon()
 }
 
 func initCmd() *cobra.Command {
@@ -585,6 +614,16 @@ roborev enqueue --sha HEAD 2>/dev/null &
 	cmd.Flags().BoolVar(&force, "force", false, "overwrite existing hook")
 
 	return cmd
+}
+
+func versionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Show roborev version",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Printf("roborev %s\n", version.Version)
+		},
+	}
 }
 
 func shortSHA(sha string) string {

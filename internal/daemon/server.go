@@ -12,6 +12,7 @@ import (
 	"github.com/wesm/roborev/internal/config"
 	"github.com/wesm/roborev/internal/git"
 	"github.com/wesm/roborev/internal/storage"
+	"github.com/wesm/roborev/internal/version"
 )
 
 // Server is the HTTP API server for the daemon
@@ -61,7 +62,7 @@ func (s *Server) Start() error {
 	s.httpServer.Addr = addr
 
 	// Write runtime info so CLI can find us
-	if err := WriteRuntime(addr, port); err != nil {
+	if err := WriteRuntime(addr, port, version.Version); err != nil {
 		log.Printf("Warning: failed to write runtime info: %v", err)
 	}
 

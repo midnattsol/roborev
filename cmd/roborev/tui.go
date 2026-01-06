@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 	"github.com/wesm/roborev/internal/storage"
+	"github.com/wesm/roborev/internal/version"
 )
 
 // TUI styles
@@ -334,8 +335,8 @@ func (m tuiModel) View() string {
 func (m tuiModel) renderQueueView() string {
 	var b strings.Builder
 
-	// Title
-	b.WriteString(tuiTitleStyle.Render("RoboRev Queue"))
+	// Title with version
+	b.WriteString(tuiTitleStyle.Render(fmt.Sprintf("RoboRev Queue (%s)", version.Version)))
 	b.WriteString("\n")
 
 	// Status line
@@ -351,8 +352,8 @@ func (m tuiModel) renderQueueView() string {
 		b.WriteString("No jobs in queue\n")
 	} else {
 		// Header (with 2-char prefix to align with row selector)
-		header := fmt.Sprintf("  %-4s %-17s %-15s %-12s %-8s %s",
-			"ID", "Ref", "Repo", "Agent", "Status", "Time")
+		header := fmt.Sprintf("  %-4s %-17s %-15s %-8s %-8s %-8s %s",
+			"ID", "Ref", "Repo", "Agent", "Status", "Queued", "Elapsed")
 		b.WriteString(tuiStatusStyle.Render(header))
 		b.WriteString("\n")
 		b.WriteString("  " + strings.Repeat("-", min(m.width-4, 78)))
@@ -419,10 +420,14 @@ func (m tuiModel) renderJobLine(job storage.ReviewJob) string {
 	}
 
 	agent := job.Agent
-	if len(agent) > 12 {
-		agent = agent[:12]
+	if len(agent) > 8 {
+		agent = agent[:8]
 	}
 
+	// Format enqueue time as relative (e.g., "2m ago")
+	enqueued := formatRelativeTime(job.EnqueuedAt)
+
+	// Format elapsed time
 	elapsed := ""
 	if job.StartedAt != nil {
 		if job.FinishedAt != nil {
@@ -453,8 +458,21 @@ func (m tuiModel) renderJobLine(job storage.ReviewJob) string {
 		styledStatus += strings.Repeat(" ", padding)
 	}
 
-	return fmt.Sprintf("%-4d %-17s %-15s %-12s %s %s",
-		job.ID, ref, repo, agent, styledStatus, elapsed)
+	return fmt.Sprintf("%-4d %-17s %-15s %-8s %s %-8s %s",
+		job.ID, ref, repo, agent, styledStatus, enqueued, elapsed)
+}
+
+// formatRelativeTime formats a time as relative (e.g., "2m ago", "1h ago")
+func formatRelativeTime(t time.Time) string {
+	d := time.Since(t)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	} else if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	} else if d < 24*time.Hour {
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	}
+	return fmt.Sprintf("%dd", int(d.Hours()/24))
 }
 
 // wrapText wraps text to the specified width, preserving existing line breaks
