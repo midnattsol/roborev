@@ -252,7 +252,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "enter":
-			if m.currentView == tuiViewQueue && len(m.jobs) > 0 {
+			if m.currentView == tuiViewQueue && len(m.jobs) > 0 && m.selectedIdx >= 0 && m.selectedIdx < len(m.jobs) {
 				job := m.jobs[m.selectedIdx]
 				if job.Status == storage.JobStatusDone {
 					return m, m.fetchReview(job.ID)
@@ -270,7 +270,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "p":
-			if m.currentView == tuiViewQueue && len(m.jobs) > 0 {
+			if m.currentView == tuiViewQueue && len(m.jobs) > 0 && m.selectedIdx >= 0 && m.selectedIdx < len(m.jobs) {
 				job := m.jobs[m.selectedIdx]
 				if job.Status == storage.JobStatusDone {
 					// Fetch review and go directly to prompt view
@@ -331,8 +331,11 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tuiJobsMsg:
 		m.jobs = msg
-		if m.selectedIdx >= len(m.jobs) {
-			m.selectedIdx = max(0, len(m.jobs)-1)
+		// Normalize selectedIdx to valid range (handles empty list and out-of-bounds)
+		if len(m.jobs) == 0 {
+			m.selectedIdx = 0
+		} else {
+			m.selectedIdx = max(0, min(len(m.jobs)-1, m.selectedIdx))
 		}
 
 	case tuiStatusMsg:
