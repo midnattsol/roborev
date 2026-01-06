@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
+	"github.com/wesm/roborev/internal/daemon"
 	"github.com/wesm/roborev/internal/storage"
 	"github.com/wesm/roborev/internal/version"
 )
@@ -48,6 +49,7 @@ const (
 
 type tuiModel struct {
 	serverAddr      string
+	daemonVersion   string
 	jobs            []storage.ReviewJob
 	status          storage.DaemonStatus
 	selectedIdx     int
@@ -69,12 +71,19 @@ type tuiPromptMsg *storage.Review
 type tuiErrMsg error
 
 func newTuiModel(serverAddr string) tuiModel {
+	// Get daemon version from runtime info
+	daemonVersion := "unknown"
+	if info, err := daemon.ReadRuntime(); err == nil {
+		daemonVersion = info.Version
+	}
+
 	return tuiModel{
-		serverAddr:  serverAddr,
-		jobs:        []storage.ReviewJob{},
-		currentView: tuiViewQueue,
-		width:       80,  // sensible defaults until we get WindowSizeMsg
-		height:      24,
+		serverAddr:    serverAddr,
+		daemonVersion: daemonVersion,
+		jobs:          []storage.ReviewJob{},
+		currentView:   tuiViewQueue,
+		width:         80, // sensible defaults until we get WindowSizeMsg
+		height:        24,
 	}
 }
 
@@ -335,8 +344,8 @@ func (m tuiModel) View() string {
 func (m tuiModel) renderQueueView() string {
 	var b strings.Builder
 
-	// Title with version
-	b.WriteString(tuiTitleStyle.Render(fmt.Sprintf("RoboRev Queue (%s)", version.Version)))
+	// Title with version info
+	b.WriteString(tuiTitleStyle.Render(fmt.Sprintf("RoboRev Queue (cli: %s, daemon: %s)", version.Version, m.daemonVersion)))
 	b.WriteString("\n")
 
 	// Status line
@@ -602,6 +611,11 @@ func tuiCmd() *cobra.Command {
 		Use:   "tui",
 		Short: "Interactive terminal UI for monitoring reviews",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Ensure daemon is running (and restart if version mismatch)
+			if err := ensureDaemon(); err != nil {
+				return fmt.Errorf("daemon error: %w", err)
+			}
+
 			if addr == "" {
 				addr = getDaemonAddr()
 			} else if !strings.HasPrefix(addr, "http://") && !strings.HasPrefix(addr, "https://") {

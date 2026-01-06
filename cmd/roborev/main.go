@@ -384,7 +384,14 @@ func statusCmd() *cobra.Command {
 		Use:   "status",
 		Short: "Show daemon and queue status",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Check if daemon is running (use runtime file to find actual port)
+			// Ensure daemon is running (and restart if version mismatch)
+			if err := ensureDaemon(); err != nil {
+				fmt.Println("Daemon: not running")
+				fmt.Println()
+				fmt.Println("Start with: roborev daemon start")
+				return nil
+			}
+
 			addr := getDaemonAddr()
 			client := &http.Client{Timeout: 2 * time.Second}
 			resp, err := client.Get(addr + "/api/status")
@@ -451,6 +458,11 @@ func showCmd() *cobra.Command {
 		Short: "Show review for a commit",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Ensure daemon is running (and restart if version mismatch)
+			if err := ensureDaemon(); err != nil {
+				return fmt.Errorf("daemon not running: %w", err)
+			}
+
 			sha := "HEAD"
 			if len(args) > 0 {
 				sha = args[0]
