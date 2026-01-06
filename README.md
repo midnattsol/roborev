@@ -41,6 +41,7 @@ roborev status       # Show queue and daemon status
 roborev show         # Show review for HEAD
 roborev show abc123  # Show review for specific commit
 roborev respond HEAD # Add response to a review
+roborev address 42   # Mark review #42 as addressed
 roborev tui          # Interactive terminal UI
 ```
 
@@ -149,11 +150,35 @@ default_agent = "claude-code"
 | `roborev status` | Show daemon and queue status |
 | `roborev show [sha]` | Display review |
 | `roborev respond <sha>` | Add response |
+| `roborev address <id>` | Mark review as addressed |
 | `roborev enqueue [commit]` | Enqueue a single commit for review |
 | `roborev enqueue <start> <end>` | Enqueue a commit range for review |
 | `roborev daemon start\|stop\|restart` | Manage daemon |
 | `roborev install-hook` | Install git hook only |
 | `roborev tui` | Interactive terminal UI |
+
+## TUI Keyboard Shortcuts
+
+The interactive TUI (`roborev tui`) supports the following keys:
+
+**Queue View:**
+| Key | Action |
+|-----|--------|
+| `↑`/`k`, `↓`/`j` | Navigate jobs |
+| `PgUp`, `PgDn` | Page through jobs |
+| `Enter` | View review |
+| `p` | View prompt |
+| `a` | Toggle addressed status |
+| `q` | Quit |
+
+**Review/Prompt View:**
+| Key | Action |
+|-----|--------|
+| `↑`/`k`, `↓`/`j` | Scroll content |
+| `PgUp`, `PgDn` | Page through content |
+| `a` | Toggle addressed status (review view) |
+| `p` | Toggle between review and prompt |
+| `Esc`/`q` | Back to queue |
 
 ## Development
 
