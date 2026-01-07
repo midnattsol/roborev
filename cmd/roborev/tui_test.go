@@ -187,6 +187,137 @@ func TestTUIToggleAddressedNoReview(t *testing.T) {
 	}
 }
 
+func TestTUIAddressReviewInBackgroundSuccess(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/review" {
+			review := storage.Review{ID: 10, Addressed: false}
+			json.NewEncoder(w).Encode(review)
+		} else if r.URL.Path == "/api/review/address" {
+			json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		}
+	}))
+	defer ts.Close()
+
+	m := newTuiModel(ts.URL)
+	cmd := m.addressReviewInBackground(42, true, false) // jobID=42, newState=true, oldState=false
+	msg := cmd()
+
+	result, ok := msg.(tuiAddressedResultMsg)
+	if !ok {
+		t.Fatalf("Expected tuiAddressedResultMsg, got %T: %v", msg, msg)
+	}
+	if result.err != nil {
+		t.Errorf("Expected no error, got %v", result.err)
+	}
+	if result.jobID != 42 {
+		t.Errorf("Expected jobID=42, got %d", result.jobID)
+	}
+	if result.oldState != false {
+		t.Errorf("Expected oldState=false, got %v", result.oldState)
+	}
+}
+
+func TestTUIAddressReviewInBackgroundNotFound(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	m := newTuiModel(ts.URL)
+	cmd := m.addressReviewInBackground(42, true, false)
+	msg := cmd()
+
+	result, ok := msg.(tuiAddressedResultMsg)
+	if !ok {
+		t.Fatalf("Expected tuiAddressedResultMsg, got %T: %v", msg, msg)
+	}
+	if result.err == nil || result.err.Error() != "no review for this job" {
+		t.Errorf("Expected 'no review for this job' error, got: %v", result.err)
+	}
+	if result.jobID != 42 {
+		t.Errorf("Expected jobID=42 for rollback, got %d", result.jobID)
+	}
+	if result.oldState != false {
+		t.Errorf("Expected oldState=false for rollback, got %v", result.oldState)
+	}
+}
+
+func TestTUIAddressReviewInBackgroundFetchError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	m := newTuiModel(ts.URL)
+	cmd := m.addressReviewInBackground(42, true, false)
+	msg := cmd()
+
+	result, ok := msg.(tuiAddressedResultMsg)
+	if !ok {
+		t.Fatalf("Expected tuiAddressedResultMsg, got %T: %v", msg, msg)
+	}
+	if result.err == nil {
+		t.Error("Expected error for 500 response")
+	}
+	if result.jobID != 42 {
+		t.Errorf("Expected jobID=42 for rollback, got %d", result.jobID)
+	}
+}
+
+func TestTUIAddressReviewInBackgroundBadJSON(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/review" {
+			w.Write([]byte("not valid json"))
+		}
+	}))
+	defer ts.Close()
+
+	m := newTuiModel(ts.URL)
+	cmd := m.addressReviewInBackground(42, true, false)
+	msg := cmd()
+
+	result, ok := msg.(tuiAddressedResultMsg)
+	if !ok {
+		t.Fatalf("Expected tuiAddressedResultMsg, got %T: %v", msg, msg)
+	}
+	if result.err == nil {
+		t.Error("Expected error for bad JSON")
+	}
+	if result.jobID != 42 {
+		t.Errorf("Expected jobID=42 for rollback, got %d", result.jobID)
+	}
+}
+
+func TestTUIAddressReviewInBackgroundAddressError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/review" {
+			review := storage.Review{ID: 10, Addressed: false}
+			json.NewEncoder(w).Encode(review)
+		} else if r.URL.Path == "/api/review/address" {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	m := newTuiModel(ts.URL)
+	cmd := m.addressReviewInBackground(42, true, false)
+	msg := cmd()
+
+	result, ok := msg.(tuiAddressedResultMsg)
+	if !ok {
+		t.Fatalf("Expected tuiAddressedResultMsg, got %T: %v", msg, msg)
+	}
+	if result.err == nil {
+		t.Error("Expected error for address 500 response")
+	}
+	if result.jobID != 42 {
+		t.Errorf("Expected jobID=42 for rollback, got %d", result.jobID)
+	}
+	if result.oldState != false {
+		t.Errorf("Expected oldState=false for rollback, got %v", result.oldState)
+	}
+}
+
 func TestTUIHTTPTimeout(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Delay longer than client timeout
