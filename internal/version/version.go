@@ -5,11 +5,21 @@ import (
 	"strings"
 )
 
-// Version returns the build version, automatically detected from VCS info
-// embedded by Go 1.18+ when building from a git repository.
-var Version = getVersion()
+// Version is the build version. Set via -ldflags for releases,
+// otherwise falls back to git commit hash from VCS info.
+var Version = "dev"
 
-func getVersion() string {
+func init() {
+	// If Version was set via ldflags, use it
+	if Version != "dev" {
+		return
+	}
+
+	// Fall back to VCS info for development builds
+	Version = getVersionFromVCS()
+}
+
+func getVersionFromVCS() string {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
 		return "dev"
