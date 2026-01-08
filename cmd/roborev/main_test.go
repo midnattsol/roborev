@@ -435,6 +435,7 @@ func TestInstallHookCmdCreatesHooksDirectory(t *testing.T) {
 
 	// Run install-hook command
 	installCmd := installHookCmd()
+	installCmd.SetArgs([]string{})
 	err := installCmd.Execute()
 
 	if err != nil {
