@@ -3126,3 +3126,519 @@ func TestTUIHideAddressedDisableNoRefetch(t *testing.T) {
 		t.Error("No command should be returned when disabling hideAddressed")
 	}
 }
+
+func TestTUIReviewMsgSetsBranchName(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.jobs = []storage.ReviewJob{
+		{ID: 1, Status: storage.JobStatusDone},
+	}
+	m.selectedIdx = 0
+	m.selectedJobID = 1
+	m.currentView = tuiViewQueue
+
+	// Receive review message with branch name
+	msg := tuiReviewMsg{
+		review:     &storage.Review{ID: 10, Output: "Review text", Job: &storage.ReviewJob{ID: 1}},
+		jobID:      1,
+		branchName: "main",
+	}
+
+	updated, _ := m.Update(msg)
+	m2 := updated.(tuiModel)
+
+	if m2.currentBranch != "main" {
+		t.Errorf("Expected currentBranch to be 'main', got '%s'", m2.currentBranch)
+	}
+}
+
+func TestTUIReviewMsgEmptyBranchForRange(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.jobs = []storage.ReviewJob{
+		{ID: 1, GitRef: "abc123..def456", Status: storage.JobStatusDone},
+	}
+	m.selectedIdx = 0
+	m.selectedJobID = 1
+	m.currentView = tuiViewQueue
+
+	// Receive review message with empty branch (range commits don't have branches)
+	msg := tuiReviewMsg{
+		review:     &storage.Review{ID: 10, Output: "Review text", Job: &storage.ReviewJob{ID: 1, GitRef: "abc123..def456"}},
+		jobID:      1,
+		branchName: "", // Empty for ranges
+	}
+
+	updated, _ := m.Update(msg)
+	m2 := updated.(tuiModel)
+
+	if m2.currentBranch != "" {
+		t.Errorf("Expected currentBranch to be empty for range, got '%s'", m2.currentBranch)
+	}
+}
+
+func TestTUIRenderReviewViewWithBranchAndAddressed(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.width = 100
+	m.height = 30
+	m.currentView = tuiViewReview
+	m.currentBranch = "feature/test"
+	m.currentReview = &storage.Review{
+		ID:        10,
+		Output:    "Some review output",
+		Addressed: true,
+		Job: &storage.ReviewJob{
+			ID:       1,
+			GitRef:   "abc1234",
+			RepoName: "myrepo",
+			Agent:    "codex",
+		},
+	}
+
+	output := m.View()
+
+	// Should contain branch info
+	if !strings.Contains(output, "on feature/test") {
+		t.Error("Expected output to contain 'on feature/test'")
+	}
+
+	// Should contain [ADDRESSED]
+	if !strings.Contains(output, "[ADDRESSED]") {
+		t.Error("Expected output to contain '[ADDRESSED]'")
+	}
+
+	// Should contain repo name and ref
+	if !strings.Contains(output, "myrepo") {
+		t.Error("Expected output to contain 'myrepo'")
+	}
+	if !strings.Contains(output, "abc1234") {
+		t.Error("Expected output to contain 'abc1234'")
+	}
+}
+
+func TestTUIRenderReviewViewNoBranchForRange(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.width = 100
+	m.height = 30
+	m.currentView = tuiViewReview
+	m.currentBranch = "" // Empty for range
+	m.currentReview = &storage.Review{
+		ID:     10,
+		Output: "Some review output",
+		Job: &storage.ReviewJob{
+			ID:       1,
+			GitRef:   "abc123..def456",
+			RepoName: "myrepo",
+			Agent:    "codex",
+		},
+	}
+
+	output := m.View()
+
+	// Should NOT contain "on " prefix when no branch
+	if strings.Contains(output, " on ") {
+		t.Error("Expected output to NOT contain ' on ' for range commits")
+	}
+
+	// Should contain the range ref
+	if !strings.Contains(output, "abc123..def456") {
+		t.Error("Expected output to contain the range ref")
+	}
+}
+
+func TestTUIRenderReviewViewNoBlankLineWithoutVerdict(t *testing.T) {
+	m := newTuiModel("http://localhost")
+	m.width = 100
+	m.height = 30
+	m.currentView = tuiViewReview
+	m.currentReview = &storage.Review{
+		ID:     10,
+		Output: "Line 1\nLine 2\nLine 3",
+		Job: &storage.ReviewJob{
+			ID:       1,
+			GitRef:   "abc1234",
+			RepoName: "myrepo",
+			Agent:    "codex",
+			Verdict:  nil, // No verdict
+		},
+	}
+
+	output := m.View()
+	lines := strings.Split(output, "\n")
+
+	// First line should be the title
+	if !strings.Contains(lines[0], "Review") {
+		t.Errorf("First line should contain 'Review', got: %s", lines[0])
+	}
+
+	// Second line should be content (Line 1), not blank
+	if len(lines) > 1 && strings.TrimSpace(lines[1]) == "" {
+		t.Error("Second line should not be blank when no verdict is present")
+	}
+	if len(lines) > 1 && !strings.Contains(lines[1], "Line 1") {
+		t.Errorf("Second line should contain content 'Line 1', got: %s", lines[1])
+	}
+}
+
+func TestTUIRenderReviewViewVerdictOnLine2(t *testing.T) {
+	verdictPass := "P"
+	m := newTuiModel("http://localhost")
+	m.width = 100
+	m.height = 30
+	m.currentView = tuiViewReview
+	m.currentReview = &storage.Review{
+		ID:     10,
+		Output: "Line 1\nLine 2\nLine 3",
+		Job: &storage.ReviewJob{
+			ID:       1,
+			GitRef:   "abc1234",
+			RepoName: "myrepo",
+			Agent:    "codex",
+			Verdict:  &verdictPass,
+		},
+	}
+
+	output := m.View()
+	lines := strings.Split(output, "\n")
+
+	// First line should be the title
+	if !strings.Contains(lines[0], "Review") {
+		t.Errorf("First line should contain 'Review', got: %s", lines[0])
+	}
+
+	// Second line should be the verdict
+	if len(lines) > 1 && !strings.Contains(lines[1], "Verdict") {
+		t.Errorf("Second line should contain 'Verdict', got: %s", lines[1])
+	}
+
+	// Third line should be content
+	if len(lines) > 2 && !strings.Contains(lines[2], "Line 1") {
+		t.Errorf("Third line should contain content 'Line 1', got: %s", lines[2])
+	}
+}
+
+func TestTUIBranchClearedOnFailedJobNavigation(t *testing.T) {
+	// Test that navigating from a successful review with branch to a failed job clears the branch
+	m := newTuiModel("http://localhost")
+	m.width = 100
+	m.height = 30
+	m.currentView = tuiViewReview
+	m.currentBranch = "main" // Cached from previous review
+	m.selectedIdx = 0
+	m.selectedJobID = 1
+
+	// Set up jobs: current is done (idx 0), next is failed (idx 1)
+	m.jobs = []storage.ReviewJob{
+		{ID: 1, Status: storage.JobStatusDone, GitRef: "abc123"},
+		{ID: 2, Status: storage.JobStatusFailed, GitRef: "def456", Error: "some error"},
+	}
+	m.currentReview = &storage.Review{
+		ID:     10,
+		Output: "Good review",
+		Job:    &m.jobs[0],
+	}
+
+	// Navigate down to failed job (j or down key in review view)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m2 := updated.(tuiModel)
+
+	// Branch should be cleared
+	if m2.currentBranch != "" {
+		t.Errorf("Expected currentBranch to be cleared when navigating to failed job, got '%s'", m2.currentBranch)
+	}
+
+	// Should still be in review view showing the failed job
+	if m2.currentView != tuiViewReview {
+		t.Errorf("Expected to stay in review view, got %d", m2.currentView)
+	}
+	if m2.currentReview == nil || !strings.Contains(m2.currentReview.Output, "Job failed") {
+		t.Error("Expected currentReview to show failed job error")
+	}
+}
+
+func TestTUIBranchClearedOnFailedJobEnter(t *testing.T) {
+	// Test that pressing Enter on a failed job clears the branch
+	m := newTuiModel("http://localhost")
+	m.width = 100
+	m.height = 30
+	m.currentView = tuiViewQueue
+	m.currentBranch = "feature/old" // Stale from previous review
+	m.selectedIdx = 0
+	m.selectedJobID = 1
+
+	m.jobs = []storage.ReviewJob{
+		{ID: 1, Status: storage.JobStatusFailed, GitRef: "abc123", Error: "build failed"},
+	}
+
+	// Press Enter to view the failed job
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m2 := updated.(tuiModel)
+
+	// Branch should be cleared
+	if m2.currentBranch != "" {
+		t.Errorf("Expected currentBranch to be cleared for failed job, got '%s'", m2.currentBranch)
+	}
+
+	// Should show review view with error
+	if m2.currentView != tuiViewReview {
+		t.Errorf("Expected review view, got %d", m2.currentView)
+	}
+}
+
+func TestTUIRenderFailedJobNoBranchShown(t *testing.T) {
+	// Test that failed jobs don't show stale branch in rendered output
+	m := newTuiModel("http://localhost")
+	m.width = 100
+	m.height = 30
+	m.currentView = tuiViewReview
+	m.currentBranch = "" // Should be cleared
+	m.currentReview = &storage.Review{
+		Agent:  "codex",
+		Output: "Job failed:\n\nsome error",
+		Job: &storage.ReviewJob{
+			ID:       1,
+			GitRef:   "abc1234",
+			RepoName: "myrepo",
+			Agent:    "codex",
+			Status:   storage.JobStatusFailed,
+		},
+	}
+
+	output := m.View()
+
+	// Should NOT contain "on " when branch is cleared
+	if strings.Contains(output, " on ") {
+		t.Error("Failed job should not show branch in output")
+	}
+}
+
+func TestTUIVisibleLinesCalculationNoVerdict(t *testing.T) {
+	// Test that visibleLines = height - 3 when no verdict (title + scroll + help)
+	// Help text is 87 chars, so use width >= 87 to avoid wrapping
+	m := newTuiModel("http://localhost")
+	m.width = 100
+	m.height = 10 // Small height to test calculation
+	m.currentView = tuiViewReview
+	// Create 20 lines of content to ensure scrolling
+	m.currentReview = &storage.Review{
+		ID:     10,
+		Output: "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\nL10\nL11\nL12\nL13\nL14\nL15\nL16\nL17\nL18\nL19\nL20",
+		Job: &storage.ReviewJob{
+			ID:      1,
+			GitRef:  "abc1234",
+			Agent:   "codex",
+			Verdict: nil, // No verdict
+		},
+	}
+
+	output := m.View()
+
+	// With height=10, no verdict, wide terminal: visibleLines = 10 - 3 = 7
+	// Non-content: title (1) + scroll indicator (1) + help (1) = 3
+	// Count content lines (L1 through L7)
+	contentCount := 0
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "L") && len(line) <= 3 {
+			contentCount++
+		}
+	}
+
+	expectedContent := 7
+	if contentCount != expectedContent {
+		t.Errorf("Expected %d content lines with height=10 and no verdict, got %d", expectedContent, contentCount)
+	}
+
+	// Should show scroll indicator since we have 20 lines but only showing 7
+	if !strings.Contains(output, "[1-7 of 20 lines]") {
+		t.Errorf("Expected scroll indicator '[1-7 of 20 lines]', output: %s", output)
+	}
+}
+
+func TestTUIVisibleLinesCalculationWithVerdict(t *testing.T) {
+	// Test that visibleLines = height - 4 when verdict present (title + verdict + scroll + help)
+	// Help text is 87 chars, so use width >= 87 to avoid wrapping
+	verdictPass := "P"
+	m := newTuiModel("http://localhost")
+	m.width = 100
+	m.height = 10 // Small height to test calculation
+	m.currentView = tuiViewReview
+	// Create 20 lines of content to ensure scrolling
+	m.currentReview = &storage.Review{
+		ID:     10,
+		Output: "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\nL10\nL11\nL12\nL13\nL14\nL15\nL16\nL17\nL18\nL19\nL20",
+		Job: &storage.ReviewJob{
+			ID:      1,
+			GitRef:  "abc1234",
+			Agent:   "codex",
+			Verdict: &verdictPass,
+		},
+	}
+
+	output := m.View()
+
+	// With height=10, verdict, wide terminal: visibleLines = 10 - 4 = 6
+	// Non-content: title (1) + verdict (1) + scroll indicator (1) + help (1) = 4
+	contentCount := 0
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "L") && len(line) <= 3 {
+			contentCount++
+		}
+	}
+
+	expectedContent := 6
+	if contentCount != expectedContent {
+		t.Errorf("Expected %d content lines with height=10 and verdict, got %d", expectedContent, contentCount)
+	}
+
+	// Should show scroll indicator since we have 20 lines but only showing 6
+	if !strings.Contains(output, "[1-6 of 20 lines]") {
+		t.Errorf("Expected scroll indicator '[1-6 of 20 lines]', output: %s", output)
+	}
+}
+
+func TestTUIVisibleLinesCalculationNarrowTerminal(t *testing.T) {
+	// Test that visibleLines accounts for help text wrapping at narrow terminals
+	// Help text is 87 chars, at width=50 it wraps to 2 lines: ceil(87/50) = 2
+	m := newTuiModel("http://localhost")
+	m.width = 50
+	m.height = 10
+	m.currentView = tuiViewReview
+	m.currentReview = &storage.Review{
+		ID:     10,
+		Output: "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\nL10\nL11\nL12\nL13\nL14\nL15\nL16\nL17\nL18\nL19\nL20",
+		Job: &storage.ReviewJob{
+			ID:      1,
+			GitRef:  "abc1234",
+			Agent:   "codex",
+			Verdict: nil, // No verdict
+		},
+	}
+
+	output := m.View()
+
+	// With height=10, no verdict, narrow terminal (help wraps to 2 lines):
+	// visibleLines = 10 - 4 = 6
+	// Non-content: title (1) + scroll indicator (1) + help (2) = 4
+	contentCount := 0
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "L") && len(line) <= 3 {
+			contentCount++
+		}
+	}
+
+	expectedContent := 6
+	if contentCount != expectedContent {
+		t.Errorf("Expected %d content lines with height=10 and narrow terminal (help wraps), got %d", expectedContent, contentCount)
+	}
+
+	// Should show scroll indicator
+	if !strings.Contains(output, "[1-6 of 20 lines]") {
+		t.Errorf("Expected scroll indicator '[1-6 of 20 lines]', output: %s", output)
+	}
+}
+
+func TestTUIVisibleLinesCalculationNarrowTerminalWithVerdict(t *testing.T) {
+	// Test narrow terminal with verdict - validates extra header line branch
+	// Help text is 87 chars, at width=50 it wraps to 2 lines: ceil(87/50) = 2
+	verdictFail := "F"
+	m := newTuiModel("http://localhost")
+	m.width = 50
+	m.height = 10
+	m.currentView = tuiViewReview
+	m.currentReview = &storage.Review{
+		ID:     10,
+		Output: "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\nL10\nL11\nL12\nL13\nL14\nL15\nL16\nL17\nL18\nL19\nL20",
+		Job: &storage.ReviewJob{
+			ID:      1,
+			GitRef:  "abc1234",
+			Agent:   "codex",
+			Verdict: &verdictFail,
+		},
+	}
+
+	output := m.View()
+
+	// With height=10, verdict present, narrow terminal (help wraps to 2 lines):
+	// visibleLines = 10 - 5 = 5
+	// Non-content: title (1) + verdict (1) + scroll indicator (1) + help (2) = 5
+	contentCount := 0
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "L") && len(line) <= 3 {
+			contentCount++
+		}
+	}
+
+	expectedContent := 5
+	if contentCount != expectedContent {
+		t.Errorf("Expected %d content lines with height=10, verdict, and narrow terminal, got %d", expectedContent, contentCount)
+	}
+
+	// Should show scroll indicator
+	if !strings.Contains(output, "[1-5 of 20 lines]") {
+		t.Errorf("Expected scroll indicator '[1-5 of 20 lines]', output: %s", output)
+	}
+
+	// Should show verdict
+	if !strings.Contains(output, "Verdict") {
+		t.Error("Expected output to contain verdict")
+	}
+}
+
+func TestTUIVisibleLinesCalculationLongTitleWraps(t *testing.T) {
+	// Test that long titles (repo/branch/range) correctly wrap and reduce visible lines
+	// Title: "Review #1 very-long-repository-name-here abc1234..def5678 (claude-code) on feature/very-long-branch-name [ADDRESSED]"
+	// That's about 120 chars, at width=50 it wraps to 3 lines: ceil(120/50) = 3
+	m := newTuiModel("http://localhost")
+	m.width = 50
+	m.height = 12
+	m.currentView = tuiViewReview
+	m.currentBranch = "feature/very-long-branch-name"
+	m.currentReview = &storage.Review{
+		ID:        10,
+		Output:    "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\nL10\nL11\nL12\nL13\nL14\nL15\nL16\nL17\nL18\nL19\nL20",
+		Addressed: true,
+		Agent:     "claude-code",
+		Job: &storage.ReviewJob{
+			ID:       1,
+			GitRef:   "abc1234567890..def5678901234", // Range ref (17 chars via shortRef)
+			RepoName: "very-long-repository-name-here",
+			Agent:    "claude-code",
+			Verdict:  nil, // No verdict
+		},
+	}
+
+	output := m.View()
+
+	// Calculate expected title length:
+	// "Review #1 very-long-repository-name-here abc1234..def5678 (claude-code) on feature/very-long-branch-name [ADDRESSED]"
+	// = 7 + 3 + 31 + 17 + 14 + 34 + 12 = ~118 chars
+	// At width=50: ceil(118/50) = 3 title lines
+	// Help at width=50: ceil(87/50) = 2 help lines
+	// Non-content: title (3) + scroll (1) + help (2) = 6
+	// visibleLines = 12 - 6 = 6
+	contentCount := 0
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "L") && len(line) <= 3 {
+			contentCount++
+		}
+	}
+
+	expectedContent := 6
+	if contentCount != expectedContent {
+		t.Errorf("Expected %d content lines with long wrapping title, got %d", expectedContent, contentCount)
+	}
+
+	// Should show scroll indicator with correct range
+	if !strings.Contains(output, "[1-6 of 20 lines]") {
+		t.Errorf("Expected scroll indicator '[1-6 of 20 lines]', output: %s", output)
+	}
+
+	// Should contain the long repo name and branch
+	if !strings.Contains(output, "very-long-repository-name-here") {
+		t.Error("Expected output to contain long repo name")
+	}
+	if !strings.Contains(output, "feature/very-long-branch-name") {
+		t.Error("Expected output to contain long branch name")
+	}
+	if !strings.Contains(output, "[ADDRESSED]") {
+		t.Error("Expected output to contain [ADDRESSED]")
+	}
+}

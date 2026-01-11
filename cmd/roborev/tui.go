@@ -14,6 +14,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
+	"github.com/wesm/roborev/internal/git"
 	"github.com/wesm/roborev/internal/storage"
 	"github.com/wesm/roborev/internal/update"
 	"github.com/wesm/roborev/internal/version"
@@ -38,8 +39,9 @@ var (
 	tuiFailedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196")) // Red
 	tuiCanceledStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("208")) // Orange
 
-	tuiPassStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("46"))  // Green
-	tuiFailStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196")) // Red
+	tuiPassStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("46"))  // Green
+	tuiFailStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196")) // Red
+	tuiAddressedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("51"))  // Cyan
 
 	tuiHelpStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("241"))
@@ -71,6 +73,7 @@ type tuiModel struct {
 	selectedJobID   int64 // Track selected job by ID to maintain position on refresh
 	currentView     tuiView
 	currentReview   *storage.Review
+	currentBranch   string // Cached branch name for current review (computed on load)
 	reviewScroll    int
 	promptScroll    int
 	promptFromQueue bool // true if prompt view was entered from queue (not review)
@@ -103,8 +106,9 @@ type tuiJobsMsg struct {
 }
 type tuiStatusMsg storage.DaemonStatus
 type tuiReviewMsg struct {
-	review *storage.Review
-	jobID  int64 // The job ID that was requested (for race condition detection)
+	review     *storage.Review
+	jobID      int64  // The job ID that was requested (for race condition detection)
+	branchName string // Pre-computed branch name (empty if not applicable)
 }
 type tuiPromptMsg *storage.Review
 type tuiAddressedMsg bool
@@ -319,7 +323,14 @@ func (m tuiModel) fetchReview(jobID int64) tea.Cmd {
 		if err := json.NewDecoder(resp.Body).Decode(&review); err != nil {
 			return tuiErrMsg(err)
 		}
-		return tuiReviewMsg{review: &review, jobID: jobID}
+
+		// Compute branch name for single commits (not ranges)
+		var branchName string
+		if review.Job != nil && review.Job.RepoPath != "" && !strings.Contains(review.Job.GitRef, "..") {
+			branchName = git.GetBranchName(review.Job.RepoPath, review.Job.GitRef)
+		}
+
+		return tuiReviewMsg{review: &review, jobID: jobID, branchName: branchName}
 	}
 }
 
@@ -806,6 +817,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if job.Status == storage.JobStatusDone {
 						return m, m.fetchReview(job.ID)
 					} else if job.Status == storage.JobStatusFailed {
+						m.currentBranch = "" // Clear stale branch from previous review
 						m.currentReview = &storage.Review{
 							Agent:  job.Agent,
 							Output: "Job failed:\n\n" + job.Error,
@@ -860,6 +872,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if job.Status == storage.JobStatusDone {
 						return m, m.fetchReview(job.ID)
 					} else if job.Status == storage.JobStatusFailed {
+						m.currentBranch = "" // Clear stale branch from previous review
 						m.currentReview = &storage.Review{
 							Agent:  job.Agent,
 							Output: "Job failed:\n\n" + job.Error,
@@ -921,6 +934,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, m.fetchReview(job.ID)
 				} else if job.Status == storage.JobStatusFailed {
 					// Show error inline for failed jobs
+					m.currentBranch = "" // Clear stale branch from previous review
 					m.currentReview = &storage.Review{
 						Agent:  job.Agent,
 						Output: "Job failed:\n\n" + job.Error,
@@ -1216,6 +1230,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.currentReview = msg.review
+		m.currentBranch = msg.branchName
 		m.currentView = tuiViewReview
 		m.reviewScroll = 0
 
@@ -1633,23 +1648,42 @@ func (m tuiModel) renderReviewView() string {
 	var b strings.Builder
 
 	review := m.currentReview
+
+	// Build title string and compute its length for line calculation
+	var title string
+	var titleLen int
 	if review.Job != nil {
 		ref := shortRef(review.Job.GitRef)
-		addressedStr := ""
-		if review.Addressed {
-			addressedStr = " [ADDRESSED]"
-		}
 		idStr := fmt.Sprintf("#%d ", review.Job.ID)
 		repoStr := ""
 		if review.Job.RepoName != "" {
 			repoStr = review.Job.RepoName + " "
 		}
-		title := fmt.Sprintf("Review %s%s%s (%s)%s", idStr, repoStr, ref, review.Agent, addressedStr)
+
+		// Use cached branch name (computed when review was loaded)
+		branchStr := ""
+		if m.currentBranch != "" {
+			branchStr = " on " + m.currentBranch
+		}
+
+		title = fmt.Sprintf("Review %s%s%s (%s)%s", idStr, repoStr, ref, review.Agent, branchStr)
+		titleLen = len(title)
+		if review.Addressed {
+			titleLen += len(" [ADDRESSED]")
+		}
+
 		b.WriteString(tuiTitleStyle.Render(title))
 
-		// Show verdict with color
-		if review.Job.Verdict != nil && *review.Job.Verdict != "" {
+		// Show [ADDRESSED] with distinct color
+		if review.Addressed {
 			b.WriteString(" ")
+			b.WriteString(tuiAddressedStyle.Render("[ADDRESSED]"))
+		}
+
+		// Show verdict on line 2 (only if present)
+		hasVerdict := review.Job.Verdict != nil && *review.Job.Verdict != ""
+		if hasVerdict {
+			b.WriteString("\n")
 			v := *review.Job.Verdict
 			if v == "P" {
 				b.WriteString(tuiPassStyle.Render("Verdict: Pass"))
@@ -1657,16 +1691,37 @@ func (m tuiModel) renderReviewView() string {
 				b.WriteString(tuiFailStyle.Render("Verdict: Fail"))
 			}
 		}
+		b.WriteString("\n")
 	} else {
-		b.WriteString(tuiTitleStyle.Render("Review"))
+		title = "Review"
+		titleLen = len(title)
+		b.WriteString(tuiTitleStyle.Render(title))
+		b.WriteString("\n")
 	}
-	b.WriteString("\n")
 
 	// Wrap text to terminal width minus padding
 	wrapWidth := max(20, min(m.width-4, 200))
 	lines := wrapText(review.Output, wrapWidth)
 
-	visibleLines := m.height - 5 // Leave room for title and help
+	// Compute title line count based on actual title length
+	titleLines := 1
+	if m.width > 0 && titleLen > m.width {
+		titleLines = (titleLen + m.width - 1) / m.width
+	}
+
+	// Help text is 87 chars, wraps at narrow terminals
+	const helpText = "up/down: scroll | j/left: prev | k/right: next | a: addressed | p: prompt | esc/q: back"
+	helpLines := 1
+	if m.width > 0 && m.width < len(helpText) {
+		helpLines = (len(helpText) + m.width - 1) / m.width
+	}
+
+	// headerHeight = title + scroll indicator (1) + help + verdict (0|1)
+	headerHeight := titleLines + 1 + helpLines
+	if review.Job != nil && review.Job.Verdict != nil && *review.Job.Verdict != "" {
+		headerHeight++ // Add 1 for verdict line
+	}
+	visibleLines := m.height - headerHeight
 
 	start := m.reviewScroll
 	if start >= len(lines) {
@@ -1686,7 +1741,7 @@ func (m tuiModel) renderReviewView() string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString(tuiHelpStyle.Render("up/down: scroll | j/left: prev | k/right: next | a: addressed | p: prompt | esc/q: back"))
+	b.WriteString(tuiHelpStyle.Render(helpText))
 
 	return b.String()
 }
