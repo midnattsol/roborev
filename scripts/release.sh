@@ -105,7 +105,7 @@ CHANGELOG_FILE=$(mktemp)
 trap 'rm -f "$CHANGELOG_FILE"' EXIT
 
 # Use changelog.sh to generate the changelog
-"$SCRIPT_DIR/changelog.sh" "$VERSION" "$EXTRA_INSTRUCTIONS" > "$CHANGELOG_FILE"
+"$SCRIPT_DIR/changelog.sh" "$VERSION" "-" "$EXTRA_INSTRUCTIONS" > "$CHANGELOG_FILE"
 
 echo ""
 echo "=========================================="
