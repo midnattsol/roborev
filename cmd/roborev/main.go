@@ -23,6 +23,7 @@ import (
 	"github.com/wesm/roborev/internal/config"
 	"github.com/wesm/roborev/internal/daemon"
 	"github.com/wesm/roborev/internal/git"
+	"github.com/wesm/roborev/internal/skills"
 	"github.com/wesm/roborev/internal/storage"
 	"github.com/wesm/roborev/internal/update"
 	"github.com/wesm/roborev/internal/version"
@@ -59,6 +60,7 @@ func main() {
 	rootCmd.AddCommand(streamCmd())
 	rootCmd.AddCommand(tuiCmd())
 	rootCmd.AddCommand(refineCmd())
+	rootCmd.AddCommand(skillsCmd())
 	rootCmd.AddCommand(updateCmd())
 	rootCmd.AddCommand(versionCmd())
 
@@ -829,38 +831,93 @@ func statusCmd() *cobra.Command {
 }
 
 func showCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "show [sha]",
-		Short: "Show review for a commit",
-		Args:  cobra.MaximumNArgs(1),
+	var forceJobID bool
+
+	cmd := &cobra.Command{
+		Use:   "show [job_id|sha]",
+		Short: "Show review for a commit or job",
+		Long: `Show review output for a commit or job.
+
+The argument can be either a job ID (numeric) or a commit SHA.
+Job IDs are displayed in review notifications and the TUI.
+
+In a git repo, the argument is first tried as a git ref. If that fails
+and it's numeric, it's treated as a job ID. Use --job to force job ID.
+
+Examples:
+  roborev show              # Show review for HEAD
+  roborev show abc123       # Show review for commit
+  roborev show 42           # Job ID (if "42" is not a valid git ref)
+  roborev show --job 42     # Force as job ID even if "42" is a valid ref`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Ensure daemon is running (and restart if version mismatch)
 			if err := ensureDaemon(); err != nil {
 				return fmt.Errorf("daemon not running: %w", err)
 			}
 
-			sha := "HEAD"
-			if len(args) > 0 {
-				sha = args[0]
-			}
+			addr := getDaemonAddr()
+			client := &http.Client{Timeout: 5 * time.Second}
 
-			// Resolve SHA if in a git repo
-			if root, err := git.GetRepoRoot("."); err == nil {
-				if resolved, err := git.ResolveSHA(root, sha); err == nil {
-					sha = resolved
+			var queryURL string
+			var displayRef string
+
+			if len(args) == 0 {
+				if forceJobID {
+					return fmt.Errorf("--job requires a job ID argument")
+				}
+				// Default to HEAD
+				sha := "HEAD"
+				if root, err := git.GetRepoRoot("."); err == nil {
+					if resolved, err := git.ResolveSHA(root, sha); err == nil {
+						sha = resolved
+					}
+				}
+				queryURL = addr + "/api/review?sha=" + sha
+				displayRef = shortSHA(sha)
+			} else {
+				arg := args[0]
+				var isJobID bool
+				var resolvedSHA string
+
+				if forceJobID {
+					isJobID = true
+				} else {
+					// Try to resolve as SHA first (handles numeric SHAs like "123456")
+					if root, err := git.GetRepoRoot("."); err == nil {
+						if resolved, err := git.ResolveSHA(root, arg); err == nil {
+							resolvedSHA = resolved
+						}
+					}
+					// If not resolvable as SHA and is numeric, treat as job ID
+					if resolvedSHA == "" {
+						if _, err := strconv.ParseInt(arg, 10, 64); err == nil {
+							isJobID = true
+						}
+					}
+				}
+
+				if isJobID {
+					queryURL = addr + "/api/review?job_id=" + arg
+					displayRef = "job " + arg
+				} else {
+					sha := arg
+					if resolvedSHA != "" {
+						sha = resolvedSHA
+					}
+					queryURL = addr + "/api/review?sha=" + sha
+					displayRef = shortSHA(sha)
 				}
 			}
 
-			addr := getDaemonAddr()
-			client := &http.Client{Timeout: 5 * time.Second}
-			resp, err := client.Get(addr + "/api/review?sha=" + sha)
+			resp, err := client.Get(queryURL)
 			if err != nil {
 				return fmt.Errorf("failed to connect to daemon (is it running?)")
 			}
 			defer resp.Body.Close()
 
 			if resp.StatusCode == http.StatusNotFound {
-				return fmt.Errorf("no review found for commit %s", shortSHA(sha))
+				return fmt.Errorf("no review found for %s", displayRef)
 			}
 
 			var review storage.Review
@@ -868,13 +925,21 @@ func showCmd() *cobra.Command {
 				return fmt.Errorf("failed to parse response: %w", err)
 			}
 
-			fmt.Printf("Review for %s (by %s)\n", shortSHA(sha), review.Agent)
+			// Avoid redundant "job X (job X, ...)" output
+			if strings.HasPrefix(displayRef, "job ") {
+				fmt.Printf("Review for %s (by %s)\n", displayRef, review.Agent)
+			} else {
+				fmt.Printf("Review for %s (job %d, by %s)\n", displayRef, review.JobID, review.Agent)
+			}
 			fmt.Println(strings.Repeat("-", 60))
 			fmt.Println(review.Output)
 
 			return nil
 		},
 	}
+
+	cmd.Flags().BoolVar(&forceJobID, "job", false, "force argument to be treated as job ID")
+	return cmd
 }
 
 func respondCmd() *cobra.Command {
@@ -1469,6 +1534,121 @@ func uninstallHookCmd() *cobra.Command {
 	}
 }
 
+func skillsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "skills",
+		Short: "Manage AI agent skills",
+		Long:  "Install and manage roborev skills for AI agents (Claude Code, Codex)",
+	}
+
+	installCmd := &cobra.Command{
+		Use:   "install",
+		Short: "Install roborev skills for AI agents",
+		Long: `Install roborev skills to your AI agent configuration directories.
+
+Skills are installed for agents whose config directories exist:
+  - Claude Code: ~/.claude/skills/
+  - Codex: ~/.codex/skills/
+
+This command is idempotent - running it multiple times is safe.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			results, err := skills.Install()
+			if err != nil {
+				return err
+			}
+
+			// formatSkills formats skill names with the correct invocation prefix per agent
+			// Claude uses /skill:name, Codex uses $skill:name
+			// Directory names use hyphens (roborev-address) but invocation uses colons (roborev:address)
+			formatSkills := func(agent skills.Agent, skillNames []string) string {
+				prefix := "/"
+				if agent == skills.AgentCodex {
+					prefix = "$"
+				}
+				formatted := make([]string, len(skillNames))
+				for i, name := range skillNames {
+					// Convert roborev-address to roborev:address
+					formatted[i] = prefix + strings.Replace(name, "roborev-", "roborev:", 1)
+				}
+				return strings.Join(formatted, ", ")
+			}
+
+			anyInstalled := false
+			var installedAgents []skills.Agent
+			for _, result := range results {
+				if result.Skipped {
+					fmt.Printf("%s: skipped (no ~/.%s directory)\n", result.Agent, result.Agent)
+					continue
+				}
+
+				if len(result.Installed) > 0 {
+					anyInstalled = true
+					installedAgents = append(installedAgents, result.Agent)
+					fmt.Printf("%s: installed %s\n", result.Agent, formatSkills(result.Agent, result.Installed))
+				}
+				if len(result.Updated) > 0 {
+					anyInstalled = true
+					if len(result.Installed) == 0 {
+						installedAgents = append(installedAgents, result.Agent)
+					}
+					fmt.Printf("%s: updated %s\n", result.Agent, formatSkills(result.Agent, result.Updated))
+				}
+			}
+
+			if !anyInstalled {
+				fmt.Println("\nNo agents found. Install Claude Code or Codex first, then run this command.")
+			} else {
+				fmt.Println("\nSkills installed! Try:")
+				for _, agent := range installedAgents {
+					if agent == skills.AgentClaude {
+						fmt.Println("  Claude Code: /roborev:address or /roborev:respond")
+					} else if agent == skills.AgentCodex {
+						fmt.Println("  Codex: $roborev:address or $roborev:respond")
+					}
+				}
+			}
+
+			return nil
+		},
+	}
+
+	updateCmd := &cobra.Command{
+		Use:   "update",
+		Short: "Update roborev skills for agents that have them installed",
+		Long: `Update roborev skills only for agents that already have them installed.
+
+Unlike 'install', this command does NOT install skills for new agents -
+it only updates existing installations. Used by 'roborev update'.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			results, err := skills.Update()
+			if err != nil {
+				return err
+			}
+
+			if len(results) == 0 {
+				fmt.Println("No skills to update (none installed)")
+				return nil
+			}
+
+			for _, result := range results {
+				if len(result.Updated) > 0 {
+					fmt.Printf("%s: updated %d skill(s)\n", result.Agent, len(result.Updated))
+				}
+				if len(result.Installed) > 0 {
+					// This can happen if user had one skill but not the other
+					fmt.Printf("%s: installed %d skill(s)\n", result.Agent, len(result.Installed))
+				}
+			}
+
+			return nil
+		},
+	}
+
+	cmd.AddCommand(installCmd)
+	cmd.AddCommand(updateCmd)
+	return cmd
+}
+
 func updateCmd() *cobra.Command {
 	var checkOnly bool
 	var yes bool
@@ -1578,6 +1758,31 @@ Requires confirmation before making changes (use --yes to skip).`,
 					fmt.Printf("warning: failed to start daemon: %v\n", err)
 				} else {
 					fmt.Println("OK")
+				}
+			}
+
+			// Update skills using the NEW binary (current process has old embedded skills)
+			// Use "skills update" to only update agents that already have skills installed
+			if skills.IsInstalled(skills.AgentClaude) || skills.IsInstalled(skills.AgentCodex) {
+				fmt.Print("Updating skills... ")
+				newBinary := filepath.Join(binDir, "roborev")
+				if runtime.GOOS == "windows" {
+					newBinary += ".exe"
+				}
+				skillsCmd := exec.Command(newBinary, "skills", "update")
+				if output, err := skillsCmd.CombinedOutput(); err != nil {
+					fmt.Printf("warning: %v\n", err)
+				} else {
+					// Parse output to show what was updated
+					lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+					for _, line := range lines {
+						if strings.Contains(line, "updated") {
+							fmt.Println(line)
+						}
+					}
+					if !strings.Contains(string(output), "updated") {
+						fmt.Println("OK")
+					}
 				}
 			}
 
