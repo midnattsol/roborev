@@ -15,6 +15,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 	"github.com/spf13/cobra"
 	"github.com/roborev-dev/roborev/internal/config"
 	"github.com/roborev-dev/roborev/internal/daemon"
@@ -976,7 +977,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			case "backspace":
 				if len(m.respondText) > 0 {
-					m.respondText = m.respondText[:len(m.respondText)-1]
+					runes := []rune(m.respondText)
+					m.respondText = string(runes[:len(runes)-1])
 				}
 				return m, nil
 			default:
@@ -1026,7 +1028,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			case "backspace":
 				if len(m.filterSearch) > 0 {
-					m.filterSearch = m.filterSearch[:len(m.filterSearch)-1]
+					runes := []rune(m.filterSearch)
+					m.filterSearch = string(runes[:len(runes)-1])
 					m.filterSelectedIdx = 0 // Reset selection when search changes
 				}
 				return m, nil
@@ -2521,11 +2524,16 @@ func (m tuiModel) renderRespondView() string {
 			if textLinesWritten >= maxTextLines {
 				break
 			}
-			// Truncate lines that are too long
-			if len(line) > boxWidth-2 {
-				line = line[:boxWidth-2]
+			// Expand tabs to spaces (4-space tabs) for consistent width calculation
+			line = strings.ReplaceAll(line, "\t", "    ")
+			// Truncate lines that are too long (use visual width for wide characters)
+			line = runewidth.Truncate(line, boxWidth-2, "")
+			// Pad based on visual width, not rune count
+			padding := boxWidth - 2 - runewidth.StringWidth(line)
+			if padding < 0 {
+				padding = 0
 			}
-			b.WriteString(fmt.Sprintf("| %-*s |\x1b[K\n", boxWidth-2, line))
+			b.WriteString(fmt.Sprintf("| %s%s |\x1b[K\n", line, strings.Repeat(" ", padding)))
 			textLinesWritten++
 		}
 	}
