@@ -126,7 +126,7 @@ func TestBackfillSourceMachineID(t *testing.T) {
 		t.Fatalf("GetOrCreateCommit failed: %v", err)
 	}
 
-	job, err := db.EnqueueJob(repo.ID, commit.ID, "abc123", "test", "thorough")
+	job, err := db.EnqueueJob(repo.ID, commit.ID, "abc123", "test", "", "thorough")
 	if err != nil {
 		t.Fatalf("EnqueueJob failed: %v", err)
 	}
@@ -514,11 +514,11 @@ func TestGetKnownJobUUIDs(t *testing.T) {
 		}
 
 		// Create two jobs with UUIDs
-		job1, err := db.EnqueueJob(repo.ID, commit.ID, "abc123", "test", "thorough")
+		job1, err := db.EnqueueJob(repo.ID, commit.ID, "abc123", "test", "", "thorough")
 		if err != nil {
 			t.Fatalf("EnqueueJob failed: %v", err)
 		}
-		job2, err := db.EnqueueJob(repo.ID, commit.ID, "def456", "test", "quick")
+		job2, err := db.EnqueueJob(repo.ID, commit.ID, "def456", "test", "", "quick")
 		if err != nil {
 			t.Fatalf("EnqueueJob failed: %v", err)
 		}
@@ -1015,7 +1015,7 @@ func TestGetJobsToSync_TimestampComparison(t *testing.T) {
 	}
 
 	// Create a job and complete it
-	job, err := db.EnqueueJob(repo.ID, commit.ID, "sync-test-sha", "test", "thorough")
+	job, err := db.EnqueueJob(repo.ID, commit.ID, "sync-test-sha", "test", "", "thorough")
 	if err != nil {
 		t.Fatalf("EnqueueJob failed: %v", err)
 	}
@@ -1092,7 +1092,7 @@ func TestGetJobsToSync_TimestampComparison(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetOrCreateCommit failed: %v", err)
 		}
-		job2, err := db.EnqueueJob(repo.ID, commit2.ID, "mixed-format-sha", "test", "thorough")
+		job2, err := db.EnqueueJob(repo.ID, commit2.ID, "mixed-format-sha", "test", "", "thorough")
 		if err != nil {
 			t.Fatalf("EnqueueJob failed: %v", err)
 		}
@@ -1178,7 +1178,7 @@ func TestGetJobsToSync_TimestampComparison(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetOrCreateCommit failed: %v", err)
 		}
-		job3, err := tzDB.EnqueueJob(tzRepo.ID, commit3.ID, "tz-test-sha", "test", "thorough")
+		job3, err := tzDB.EnqueueJob(tzRepo.ID, commit3.ID, "tz-test-sha", "test", "", "thorough")
 		if err != nil {
 			t.Fatalf("EnqueueJob failed: %v", err)
 		}
@@ -1255,7 +1255,7 @@ func TestGetReviewsToSync_TimestampComparison(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrCreateCommit failed: %v", err)
 	}
-	job, err := db.EnqueueJob(repo.ID, commit.ID, "review-sync-sha", "test", "thorough")
+	job, err := db.EnqueueJob(repo.ID, commit.ID, "review-sync-sha", "test", "", "thorough")
 	if err != nil {
 		t.Fatalf("EnqueueJob failed: %v", err)
 	}
@@ -1410,7 +1410,7 @@ func TestGetReviewsToSync_TimestampComparison(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetOrCreateCommit failed: %v", err)
 		}
-		tzJob, err := tzDB.EnqueueJob(tzRepo.ID, tzCommit.ID, "tz-review-sha", "test", "thorough")
+		tzJob, err := tzDB.EnqueueJob(tzRepo.ID, tzCommit.ID, "tz-review-sha", "test", "", "thorough")
 		if err != nil {
 			t.Fatalf("EnqueueJob failed: %v", err)
 		}
@@ -1502,7 +1502,7 @@ func TestGetCommentsToSync_LegacyCommentsExcluded(t *testing.T) {
 	}
 
 	// Create a job-based response (should be synced)
-	job, err := db.EnqueueJob(repo.ID, commit.ID, "legacy-resp-sha", "test", "thorough")
+	job, err := db.EnqueueJob(repo.ID, commit.ID, "legacy-resp-sha", "test", "", "thorough")
 	if err != nil {
 		t.Fatalf("EnqueueJob failed: %v", err)
 	}
@@ -1617,7 +1617,7 @@ func TestUpsertPulledResponse_WithParentJob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrCreateCommit failed: %v", err)
 	}
-	job, err := db.EnqueueJob(repo.ID, commit.ID, "parent-job-sha", "test", "thorough")
+	job, err := db.EnqueueJob(repo.ID, commit.ID, "parent-job-sha", "test", "", "thorough")
 	if err != nil {
 		t.Fatalf("EnqueueJob failed: %v", err)
 	}
@@ -1913,7 +1913,7 @@ func (h *syncTestHelper) createCompletedJob(sha string) *ReviewJob {
 	if err != nil {
 		h.t.Fatalf("Failed to create commit: %v", err)
 	}
-	job, err := h.db.EnqueueJob(h.repo.ID, commit.ID, sha, "test", "thorough")
+	job, err := h.db.EnqueueJob(h.repo.ID, commit.ID, sha, "test", "", "thorough")
 	if err != nil {
 		h.t.Fatalf("Failed to enqueue job: %v", err)
 	}
@@ -2155,5 +2155,88 @@ func TestSyncOrder_FullWorkflow(t *testing.T) {
 	}
 	if len(responses) != 3 {
 		t.Errorf("Expected 3 responses to sync, got %d", len(responses))
+	}
+}
+
+func TestUpsertPulledJob_BackfillsModel(t *testing.T) {
+	// This test verifies that upserting a pulled job with a model value backfills
+	// an existing job that has NULL model (COALESCE behavior in SQLite)
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Create a repo
+	repo, err := db.GetOrCreateRepo("/test/repo")
+	if err != nil {
+		t.Fatalf("GetOrCreateRepo failed: %v", err)
+	}
+
+	// Insert a job with NULL model using EnqueueJob (which sets model to empty string by default)
+	// We need to directly insert with NULL model to test the COALESCE behavior
+	jobUUID := "test-uuid-backfill-" + time.Now().Format("20060102150405")
+	_, err = db.Exec(`
+		INSERT INTO review_jobs (uuid, repo_id, git_ref, agent, status, enqueued_at)
+		VALUES (?, ?, 'HEAD', 'test-agent', 'done', datetime('now'))
+	`, jobUUID, repo.ID)
+	if err != nil {
+		t.Fatalf("Failed to insert job with NULL model: %v", err)
+	}
+
+	// Verify model is NULL
+	var modelBefore sql.NullString
+	err = db.QueryRow(`SELECT model FROM review_jobs WHERE uuid = ?`, jobUUID).Scan(&modelBefore)
+	if err != nil {
+		t.Fatalf("Failed to query model before: %v", err)
+	}
+	if modelBefore.Valid {
+		t.Fatalf("Expected model to be NULL before upsert, got %q", modelBefore.String)
+	}
+
+	// Upsert with a model value - should backfill
+	pulledJob := PulledJob{
+		UUID:            jobUUID,
+		RepoIdentity:    "/test/repo",
+		GitRef:          "HEAD",
+		Agent:           "test-agent",
+		Model:           "gpt-4", // Now providing a model
+		Status:          "done",
+		SourceMachineID: "test-machine",
+		EnqueuedAt:      time.Now(),
+		UpdatedAt:       time.Now(),
+	}
+	err = db.UpsertPulledJob(pulledJob, repo.ID, nil)
+	if err != nil {
+		t.Fatalf("UpsertPulledJob failed: %v", err)
+	}
+
+	// Verify model was backfilled
+	var modelAfter sql.NullString
+	err = db.QueryRow(`SELECT model FROM review_jobs WHERE uuid = ?`, jobUUID).Scan(&modelAfter)
+	if err != nil {
+		t.Fatalf("Failed to query model after: %v", err)
+	}
+	if !modelAfter.Valid {
+		t.Error("Expected model to be backfilled, but it's still NULL")
+	} else if modelAfter.String != "gpt-4" {
+		t.Errorf("Expected model 'gpt-4', got %q", modelAfter.String)
+	}
+
+	// Also verify that upserting with empty model doesn't clear existing model
+	pulledJob.Model = "" // Empty model
+	err = db.UpsertPulledJob(pulledJob, repo.ID, nil)
+	if err != nil {
+		t.Fatalf("UpsertPulledJob (empty model) failed: %v", err)
+	}
+
+	var modelPreserved sql.NullString
+	err = db.QueryRow(`SELECT model FROM review_jobs WHERE uuid = ?`, jobUUID).Scan(&modelPreserved)
+	if err != nil {
+		t.Fatalf("Failed to query model preserved: %v", err)
+	}
+	if !modelPreserved.Valid || modelPreserved.String != "gpt-4" {
+		t.Errorf("Expected model to be preserved as 'gpt-4' when upserting with empty model, got %v", modelPreserved)
 	}
 }

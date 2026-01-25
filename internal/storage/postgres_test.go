@@ -1,6 +1,7 @@
 package storage
 
 import (
+	_ "embed"
 	"fmt"
 	"os"
 	"strings"
@@ -10,6 +11,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+//go:embed schemas/postgres_v1.sql
+var postgresV1Schema string
 
 func TestDefaultPgPoolConfig(t *testing.T) {
 	cfg := DefaultPgPoolConfig()
@@ -32,22 +36,23 @@ func TestDefaultPgPoolConfig(t *testing.T) {
 }
 
 func TestPgSchemaStatementsContainsRequiredTables(t *testing.T) {
-	requiredTables := []string{
-		"CREATE TABLE IF NOT EXISTS schema_version",
-		"CREATE TABLE IF NOT EXISTS machines",
-		"CREATE TABLE IF NOT EXISTS repos",
-		"CREATE TABLE IF NOT EXISTS commits",
-		"CREATE TABLE IF NOT EXISTS review_jobs",
-		"CREATE TABLE IF NOT EXISTS reviews",
-		"CREATE TABLE IF NOT EXISTS responses",
+	requiredStatements := []string{
+		"CREATE SCHEMA IF NOT EXISTS roborev",
+		"CREATE TABLE IF NOT EXISTS roborev.schema_version",
+		"CREATE TABLE IF NOT EXISTS roborev.machines",
+		"CREATE TABLE IF NOT EXISTS roborev.repos",
+		"CREATE TABLE IF NOT EXISTS roborev.commits",
+		"CREATE TABLE IF NOT EXISTS roborev.review_jobs",
+		"CREATE TABLE IF NOT EXISTS roborev.reviews",
+		"CREATE TABLE IF NOT EXISTS roborev.responses",
 	}
 
 	// Join all statements to search across the actual executed schema
-	allStatements := strings.Join(pgSchemaStatements, "\n")
+	allStatements := strings.Join(pgSchemaStatements(), "\n")
 
-	for _, table := range requiredTables {
-		if !strings.Contains(allStatements, table) {
-			t.Errorf("Schema missing: %s", table)
+	for _, required := range requiredStatements {
+		if !strings.Contains(allStatements, required) {
+			t.Errorf("Schema missing: %s", required)
 		}
 	}
 }
@@ -63,7 +68,7 @@ func TestPgSchemaStatementsContainsRequiredIndexes(t *testing.T) {
 	}
 
 	// Join all statements to search across the actual executed schema
-	allStatements := strings.Join(pgSchemaStatements, "\n")
+	allStatements := strings.Join(pgSchemaStatements(), "\n")
 
 	for _, idx := range requiredIndexes {
 		if !strings.Contains(allStatements, idx) {
@@ -1093,7 +1098,7 @@ func TestIntegration_NewDatabaseClearsSyncedAt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrCreateCommit failed: %v", err)
 	}
-	job, err := sqliteDB.EnqueueJob(repo.ID, commit.ID, "test-sha", "test", "thorough")
+	job, err := sqliteDB.EnqueueJob(repo.ID, commit.ID, "test-sha", "test", "", "thorough")
 	if err != nil {
 		t.Fatalf("EnqueueJob failed: %v", err)
 	}
@@ -1476,4 +1481,235 @@ func TestIntegration_BatchOperations(t *testing.T) {
 			t.Error("Expected success[1]=false (invalid FK)")
 		}
 	})
+}
+
+func TestIntegration_EnsureSchema_MigratesV1ToV2(t *testing.T) {
+	// This test verifies that a v1 schema (without model column) gets migrated to v2
+	connString := getTestPostgresURL(t)
+	ctx := t.Context()
+
+	// Create a pool without AfterConnect to set up test state
+	cfg, err := pgxpool.ParseConfig(connString)
+	if err != nil {
+		t.Fatalf("Failed to parse config: %v", err)
+	}
+	setupPool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create setup pool: %v", err)
+	}
+
+	// Drop any existing schema to start fresh - this test needs to verify v1→v2 migration
+	_, err = setupPool.Exec(ctx, "DROP SCHEMA IF EXISTS roborev CASCADE")
+	if err != nil {
+		setupPool.Close()
+		t.Fatalf("Failed to drop existing schema: %v", err)
+	}
+
+	// Cleanup after test
+	t.Cleanup(func() {
+		cleanupCfg, _ := pgxpool.ParseConfig(connString)
+		cleanupPool, _ := pgxpool.NewWithConfig(ctx, cleanupCfg)
+		if cleanupPool != nil {
+			cleanupPool.Exec(ctx, "DROP SCHEMA IF EXISTS roborev CASCADE")
+			cleanupPool.Close()
+		}
+	})
+
+	// Load and execute v1 schema from embedded SQL file
+	// Use same parsing logic as pgSchemaStatements() to handle comments correctly
+	for _, stmt := range strings.Split(postgresV1Schema, ";") {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		// Skip statements that are only comments
+		hasCode := false
+		for _, line := range strings.Split(stmt, "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" && !strings.HasPrefix(line, "--") {
+				hasCode = true
+				break
+			}
+		}
+		if !hasCode {
+			continue
+		}
+		if _, err := setupPool.Exec(ctx, stmt); err != nil {
+			setupPool.Close()
+			t.Fatalf("Failed to execute v1 schema statement: %v\nStatement: %s", err, stmt)
+		}
+	}
+
+	// Insert a test job to verify data survives migration
+	testJobUUID := uuid.NewString()
+	var repoID int64
+	err = setupPool.QueryRow(ctx, `
+		INSERT INTO roborev.repos (identity) VALUES ('test-repo-v1-migration') RETURNING id
+	`).Scan(&repoID)
+	if err != nil {
+		setupPool.Close()
+		t.Fatalf("Failed to insert test repo: %v", err)
+	}
+	_, err = setupPool.Exec(ctx, `
+		INSERT INTO roborev.review_jobs (uuid, repo_id, git_ref, agent, status, source_machine_id, enqueued_at)
+		VALUES ($1, $2, 'HEAD', 'test-agent', 'done', '00000000-0000-0000-0000-000000000001', NOW())
+	`, testJobUUID, repoID)
+	if err != nil {
+		setupPool.Close()
+		t.Fatalf("Failed to insert test job: %v", err)
+	}
+
+	setupPool.Close()
+
+	// Now connect with the normal pool and run EnsureSchema - should migrate v1→v2
+	pool, err := NewPgPool(ctx, connString, DefaultPgPoolConfig())
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer pool.Close()
+
+	err = pool.EnsureSchema(ctx)
+	if err != nil {
+		t.Fatalf("EnsureSchema failed: %v", err)
+	}
+
+	// Verify schema version advanced to 2
+	var version int
+	err = pool.pool.QueryRow(ctx, `SELECT MAX(version) FROM schema_version`).Scan(&version)
+	if err != nil {
+		t.Fatalf("Failed to query schema version: %v", err)
+	}
+	if version != pgSchemaVersion {
+		t.Errorf("Expected schema version %d, got %d", pgSchemaVersion, version)
+	}
+
+	// Verify model column was added
+	var hasModelColumn bool
+	err = pool.pool.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = 'roborev' AND table_name = 'review_jobs' AND column_name = 'model'
+		)
+	`).Scan(&hasModelColumn)
+	if err != nil {
+		t.Fatalf("Failed to check for model column: %v", err)
+	}
+	if !hasModelColumn {
+		t.Error("Expected model column to exist after v1→v2 migration")
+	}
+
+	// Verify pre-existing job survived migration with model=NULL
+	var jobAgent string
+	var jobModel *string
+	err = pool.pool.QueryRow(ctx, `SELECT agent, model FROM review_jobs WHERE uuid = $1`, testJobUUID).Scan(&jobAgent, &jobModel)
+	if err != nil {
+		t.Fatalf("Failed to query test job after migration: %v", err)
+	}
+	if jobAgent != "test-agent" {
+		t.Errorf("Expected agent 'test-agent', got %q", jobAgent)
+	}
+	if jobModel != nil {
+		t.Errorf("Expected model to be NULL for pre-migration job, got %q", *jobModel)
+	}
+}
+
+func TestIntegration_UpsertJob_BackfillsModel(t *testing.T) {
+	// This test verifies that upserting a job with a model value backfills
+	// an existing job that has NULL model (COALESCE behavior)
+	connString := getTestPostgresURL(t)
+	ctx := t.Context()
+
+	pool, err := NewPgPool(ctx, connString, DefaultPgPoolConfig())
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer pool.Close()
+
+	if err := pool.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema failed: %v", err)
+	}
+
+	// Create test data
+	machineID := uuid.NewString()
+	jobUUID := uuid.NewString()
+	repoIdentity := "test-repo-backfill-" + time.Now().Format("20060102150405")
+
+	defer func() {
+		// Cleanup
+		pool.pool.Exec(ctx, `DELETE FROM review_jobs WHERE uuid = $1`, jobUUID)
+		pool.pool.Exec(ctx, `DELETE FROM repos WHERE identity = $1`, repoIdentity)
+		pool.pool.Exec(ctx, `DELETE FROM machines WHERE machine_id = $1`, machineID)
+	}()
+
+	// Register machine and create repo
+	if err := pool.RegisterMachine(ctx, machineID, "test"); err != nil {
+		t.Fatalf("RegisterMachine failed: %v", err)
+	}
+	repoID, err := pool.GetOrCreateRepo(ctx, repoIdentity)
+	if err != nil {
+		t.Fatalf("GetOrCreateRepo failed: %v", err)
+	}
+
+	// Insert job with NULL model directly
+	_, err = pool.pool.Exec(ctx, `
+		INSERT INTO review_jobs (uuid, repo_id, git_ref, agent, status, source_machine_id, enqueued_at, created_at, updated_at)
+		VALUES ($1, $2, 'HEAD', 'test-agent', 'done', $3, NOW(), NOW(), NOW())
+	`, jobUUID, repoID, machineID)
+	if err != nil {
+		t.Fatalf("Failed to insert job with NULL model: %v", err)
+	}
+
+	// Verify model is NULL
+	var modelBefore *string
+	err = pool.pool.QueryRow(ctx, `SELECT model FROM review_jobs WHERE uuid = $1`, jobUUID).Scan(&modelBefore)
+	if err != nil {
+		t.Fatalf("Failed to query model before: %v", err)
+	}
+	if modelBefore != nil {
+		t.Fatalf("Expected model to be NULL before upsert, got %q", *modelBefore)
+	}
+
+	// Upsert with a model value - should backfill
+	job := SyncableJob{
+		UUID:            jobUUID,
+		RepoIdentity:    repoIdentity,
+		GitRef:          "HEAD",
+		Agent:           "test-agent",
+		Model:           "gpt-4", // Now providing a model
+		Status:          "done",
+		SourceMachineID: machineID,
+		EnqueuedAt:      time.Now(),
+	}
+	err = pool.UpsertJob(ctx, job, repoID, nil)
+	if err != nil {
+		t.Fatalf("UpsertJob failed: %v", err)
+	}
+
+	// Verify model was backfilled
+	var modelAfter *string
+	err = pool.pool.QueryRow(ctx, `SELECT model FROM review_jobs WHERE uuid = $1`, jobUUID).Scan(&modelAfter)
+	if err != nil {
+		t.Fatalf("Failed to query model after: %v", err)
+	}
+	if modelAfter == nil {
+		t.Error("Expected model to be backfilled, but it's still NULL")
+	} else if *modelAfter != "gpt-4" {
+		t.Errorf("Expected model 'gpt-4', got %q", *modelAfter)
+	}
+
+	// Also verify that upserting with empty model doesn't clear existing model
+	job.Model = "" // Empty model
+	err = pool.UpsertJob(ctx, job, repoID, nil)
+	if err != nil {
+		t.Fatalf("UpsertJob (empty model) failed: %v", err)
+	}
+
+	var modelPreserved *string
+	err = pool.pool.QueryRow(ctx, `SELECT model FROM review_jobs WHERE uuid = $1`, jobUUID).Scan(&modelPreserved)
+	if err != nil {
+		t.Fatalf("Failed to query model preserved: %v", err)
+	}
+	if modelPreserved == nil || *modelPreserved != "gpt-4" {
+		t.Errorf("Expected model to be preserved as 'gpt-4' when upserting with empty model, got %v", modelPreserved)
+	}
 }

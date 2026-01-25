@@ -3,14 +3,17 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os/exec"
+	"strings"
 )
 
 // OpenCodeAgent runs code reviews using the OpenCode CLI
 type OpenCodeAgent struct {
 	Command   string         // The opencode command to run (default: "opencode")
+	Model     string         // Model to use (provider/model format, e.g., "anthropic/claude-sonnet-4-20250514")
 	Reasoning ReasoningLevel // Reasoning level (for future support)
 	Agentic   bool           // Whether agentic mode is enabled (OpenCode auto-approves in non-interactive mode)
 }
@@ -23,9 +26,14 @@ func NewOpenCodeAgent(command string) *OpenCodeAgent {
 	return &OpenCodeAgent{Command: command, Reasoning: ReasoningStandard}
 }
 
-// WithReasoning returns the agent unchanged (reasoning not supported).
+// WithReasoning returns a copy of the agent with the model preserved (reasoning not yet supported).
 func (a *OpenCodeAgent) WithReasoning(level ReasoningLevel) Agent {
-	return a
+	return &OpenCodeAgent{
+		Command:   a.Command,
+		Model:     a.Model,
+		Reasoning: level,
+		Agentic:   a.Agentic,
+	}
 }
 
 // WithAgentic returns a copy of the agent configured for agentic mode.
@@ -34,8 +42,19 @@ func (a *OpenCodeAgent) WithReasoning(level ReasoningLevel) Agent {
 func (a *OpenCodeAgent) WithAgentic(agentic bool) Agent {
 	return &OpenCodeAgent{
 		Command:   a.Command,
+		Model:     a.Model,
 		Reasoning: a.Reasoning,
 		Agentic:   agentic,
+	}
+}
+
+// WithModel returns a copy of the agent configured to use the specified model.
+func (a *OpenCodeAgent) WithModel(model string) Agent {
+	return &OpenCodeAgent{
+		Command:   a.Command,
+		Model:     model,
+		Reasoning: a.Reasoning,
+		Agentic:   a.Agentic,
 	}
 }
 
@@ -47,6 +66,44 @@ func (a *OpenCodeAgent) CommandName() string {
 	return a.Command
 }
 
+// filterOpencodeToolCallLines removes LLM tool-call JSON lines that may appear in stdout.
+// When LLM providers stream responses, raw tool calls in the standard format
+// {"name":"...","arguments":{...}} (exactly 2 keys) may occasionally leak through
+// to stdout. Normally OpenCode formats these with ANSI codes, but edge cases
+// (streaming glitches, format failures) can expose the raw JSON.
+// We filter lines matching this exact format while preserving legitimate JSON
+// examples which would have additional keys.
+func filterOpencodeToolCallLines(s string) string {
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		if isOpencodeToolCallLine(line) {
+			continue
+		}
+		out = append(out, line)
+	}
+	// Only trim trailing newlines to preserve leading indentation in code blocks
+	return strings.TrimRight(strings.Join(out, "\n"), "\r\n")
+}
+
+func isOpencodeToolCallLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &m); err != nil {
+		return false
+	}
+	// Tool calls have exactly "name" and "arguments" keys, nothing else.
+	// This avoids stripping legitimate JSON examples that happen to include these keys.
+	if len(m) != 2 {
+		return false
+	}
+	_, hasName := m["name"]
+	_, hasArgs := m["arguments"]
+	return hasName && hasArgs
+}
+
 func (a *OpenCodeAgent) Review(ctx context.Context, repoPath, commitSHA, prompt string, output io.Writer) (string, error) {
 	// OpenCode CLI supports a headless invocation via `opencode run [message..]`.
 	// We run it from the repo root so it can use project context, and pass the full
@@ -55,7 +112,11 @@ func (a *OpenCodeAgent) Review(ctx context.Context, repoPath, commitSHA, prompt 
 	// Helpful reference:
 	//   opencode --help
 	//   opencode run --help
-	args := []string{"run", "--format", "default", prompt}
+	args := []string{"run", "--format", "default"}
+	if a.Model != "" {
+		args = append(args, "--model", a.Model)
+	}
+	args = append(args, prompt)
 
 	cmd := exec.CommandContext(ctx, a.Command, args...)
 	cmd.Dir = repoPath
@@ -79,11 +140,10 @@ func (a *OpenCodeAgent) Review(ctx context.Context, repoPath, commitSHA, prompt 
 		)
 	}
 
-	result := stdout.String()
+	result := filterOpencodeToolCallLines(stdout.String())
 	if len(result) == 0 {
 		return "No review output generated", nil
 	}
-
 	return result, nil
 }
 
