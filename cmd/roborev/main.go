@@ -569,6 +569,7 @@ func reviewCmd() *cobra.Command {
 		agent      string
 		model      string
 		reasoning  string
+		fast       bool
 		quiet      bool
 		dirty      bool
 		wait       bool
@@ -600,6 +601,9 @@ Examples:
 				cmd.SilenceErrors = true
 				cmd.SilenceUsage = true
 			}
+
+			// --fast is shorthand for --reasoning fast (explicit --reasoning takes precedence)
+			reasoning = resolveReasoningWithFast(reasoning, fast, cmd.Flags().Changed("reasoning"))
 
 			// Default to current directory
 			if repoPath == "" {
@@ -817,6 +821,7 @@ Examples:
 	cmd.Flags().StringVar(&agent, "agent", "", "agent to use (codex, claude-code, gemini, copilot, opencode)")
 	cmd.Flags().StringVar(&model, "model", "", "model for agent (format varies: opencode uses provider/model, others use model name)")
 	cmd.Flags().StringVar(&reasoning, "reasoning", "", "reasoning level: thorough (default), standard, or fast")
+	cmd.Flags().BoolVar(&fast, "fast", false, "shorthand for --reasoning fast")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress output (for use in hooks)")
 	cmd.Flags().BoolVar(&dirty, "dirty", false, "review uncommitted changes instead of a commit")
 	cmd.Flags().BoolVar(&wait, "wait", false, "wait for review to complete and show result")
@@ -2364,6 +2369,15 @@ func formatAgentLabel(agent string, model string) string {
 		return fmt.Sprintf("%s: %s", agent, model)
 	}
 	return agent
+}
+
+// resolveReasoningWithFast returns the effective reasoning value, applying
+// the --fast shorthand only when --reasoning wasn't explicitly set.
+func resolveReasoningWithFast(reasoning string, fast bool, reasoningExplicitlySet bool) string {
+	if fast && !reasoningExplicitlySet {
+		return "fast"
+	}
+	return reasoning
 }
 
 // generateHookContent creates the post-commit hook script content.

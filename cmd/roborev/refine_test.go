@@ -1056,3 +1056,52 @@ func TestValidateRefineContext_FeatureBranchWithoutSinceStillWorks(t *testing.T)
 		t.Errorf("expected mergeBase=%s (base commit), got %s", baseSHA, mergeBase)
 	}
 }
+
+func TestResolveReasoningWithFast(t *testing.T) {
+	tests := []struct {
+		name                  string
+		reasoning             string
+		fast                  bool
+		reasoningExplicitlySet bool
+		want                  string
+	}{
+		{
+			name:                  "fast flag sets reasoning to fast",
+			reasoning:             "",
+			fast:                  true,
+			reasoningExplicitlySet: false,
+			want:                  "fast",
+		},
+		{
+			name:                  "explicit reasoning takes precedence over fast",
+			reasoning:             "thorough",
+			fast:                  true,
+			reasoningExplicitlySet: true,
+			want:                  "thorough",
+		},
+		{
+			name:                  "no fast flag preserves reasoning",
+			reasoning:             "standard",
+			fast:                  false,
+			reasoningExplicitlySet: true,
+			want:                  "standard",
+		},
+		{
+			name:                  "no flags returns empty",
+			reasoning:             "",
+			fast:                  false,
+			reasoningExplicitlySet: false,
+			want:                  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveReasoningWithFast(tt.reasoning, tt.fast, tt.reasoningExplicitlySet)
+			if got != tt.want {
+				t.Errorf("resolveReasoningWithFast(%q, %v, %v) = %q, want %q",
+					tt.reasoning, tt.fast, tt.reasoningExplicitlySet, got, tt.want)
+			}
+		})
+	}
+}

@@ -33,6 +33,7 @@ func refineCmd() *cobra.Command {
 		agentName         string
 		model             string
 		reasoning         string
+		fast              bool
 		maxIterations     int
 		quiet             bool
 		allowUnsafeAgents bool
@@ -61,6 +62,8 @@ The agent will run tests and verify the build before committing.
 Use --since to specify a starting commit when on the main branch or to
 limit how far back to look for reviews to address.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// --fast is shorthand for --reasoning fast (explicit --reasoning takes precedence)
+			reasoning = resolveReasoningWithFast(reasoning, fast, cmd.Flags().Changed("reasoning"))
 			unsafeFlagChanged := cmd.Flags().Changed("allow-unsafe-agents")
 			return runRefine(agentName, model, reasoning, maxIterations, quiet, allowUnsafeAgents, unsafeFlagChanged, since)
 		},
@@ -69,6 +72,7 @@ limit how far back to look for reviews to address.`,
 	cmd.Flags().StringVar(&agentName, "agent", "", "agent to use for addressing findings (default: from config)")
 	cmd.Flags().StringVar(&model, "model", "", "model for agent (format varies: opencode uses provider/model, others use model name)")
 	cmd.Flags().StringVar(&reasoning, "reasoning", "", "reasoning level: fast, standard (default), or thorough")
+	cmd.Flags().BoolVar(&fast, "fast", false, "shorthand for --reasoning fast")
 	cmd.Flags().IntVar(&maxIterations, "max-iterations", 10, "maximum refinement iterations")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "suppress agent output, show elapsed time instead")
 	cmd.Flags().BoolVar(&allowUnsafeAgents, "allow-unsafe-agents", false, "allow agents to run without sandboxing")
@@ -211,24 +215,24 @@ func runRefine(agentName, modelStr, reasoningStr string, maxIterations int, quie
 		fmt.Printf("Refining branch %q (diverged from %s at %s)\n", currentBranch, defaultBranch, mergeBase[:7])
 	}
 
-	// Resolve agent
+	// Resolve reasoning level from CLI or config (default: standard for refine)
 	cfg, _ := config.LoadGlobal()
-	resolvedAgent := config.ResolveAgent(agentName, repoPath, cfg)
-	allowUnsafeAgents = resolveAllowUnsafeAgents(allowUnsafeAgents, unsafeFlagChanged, cfg)
-	agent.SetAllowUnsafeAgents(allowUnsafeAgents)
-	if cfg != nil {
-		agent.SetAnthropicAPIKey(cfg.AnthropicAPIKey)
-	}
-
-	// Resolve reasoning level from CLI or config (default: fast)
 	resolvedReasoning, err := config.ResolveRefineReasoning(reasoningStr, repoPath)
 	if err != nil {
 		return err
 	}
 	reasoningLevel := agent.ParseReasoningLevel(resolvedReasoning)
 
-	// Resolve model from CLI or config
-	resolvedModel := config.ResolveModel(modelStr, repoPath, cfg)
+	// Resolve agent for refine workflow at this reasoning level
+	resolvedAgent := config.ResolveAgentForWorkflow(agentName, repoPath, cfg, "refine", resolvedReasoning)
+	allowUnsafeAgents = resolveAllowUnsafeAgents(allowUnsafeAgents, unsafeFlagChanged, cfg)
+	agent.SetAllowUnsafeAgents(allowUnsafeAgents)
+	if cfg != nil {
+		agent.SetAnthropicAPIKey(cfg.AnthropicAPIKey)
+	}
+
+	// Resolve model for refine workflow at this reasoning level
+	resolvedModel := config.ResolveModelForWorkflow(modelStr, repoPath, cfg, "refine", resolvedReasoning)
 
 	// Get the agent with configured reasoning level and model
 	addressAgent, err := selectRefineAgent(resolvedAgent, reasoningLevel, resolvedModel)
