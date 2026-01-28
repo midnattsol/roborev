@@ -4260,6 +4260,33 @@ func TestTUIRenderFailedJobNoBranchShown(t *testing.T) {
 	}
 }
 
+func TestTUIRenderQueueViewBranchFilterOnlyNoPanic(t *testing.T) {
+	// Test that renderQueueView doesn't panic when branch filter is active
+	// but repo filter is empty (regression test for index out of range)
+	m := newTuiModel("http://localhost")
+	m.width = 100
+	m.height = 30
+	m.currentView = tuiViewQueue
+	m.activeBranchFilter = "feature"
+	m.activeRepoFilter = nil // Empty repo filter
+	m.filterStack = []string{"branch"}
+	m.jobs = []storage.ReviewJob{
+		{ID: 1, Branch: "feature", RepoName: "test"},
+	}
+
+	// This should not panic
+	output := m.View()
+
+	// Should show branch filter indicator
+	if !strings.Contains(output, "[b: feature]") {
+		t.Error("Expected branch filter indicator in output")
+	}
+	// Should NOT show repo filter indicator (since no repo filter)
+	if strings.Contains(output, "[f:") {
+		t.Error("Should not show repo filter indicator when activeRepoFilter is empty")
+	}
+}
+
 func TestTUIVisibleLinesCalculationNoVerdict(t *testing.T) {
 	// Test that visibleLines = height - 4 when no verdict (title + location + status + help)
 	// Help text is ~106 chars, so use width >= 110 to avoid wrapping
@@ -7410,6 +7437,81 @@ func TestTUINavigateDownNoLoadMoreWhenBranchFiltered(t *testing.T) {
 	if cmd != nil {
 		t.Error("Should not return command when branch filter is active")
 	}
+}
+
+func TestTUINavigateJKeyNoLoadMoreWhenBranchFiltered(t *testing.T) {
+	// Test that j/left key pagination is disabled when branch filter is active
+	m := newTuiModel("http://localhost")
+
+	m.jobs = []storage.ReviewJob{{ID: 1, Branch: "feature"}}
+	m.selectedIdx = 0
+	m.selectedJobID = 1
+	m.hasMore = true
+	m.loadingMore = false
+	m.activeBranchFilter = "feature"
+	m.currentView = tuiViewQueue
+
+	// Press j at bottom - should NOT trigger load more
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m2 := updated.(tuiModel)
+
+	if m2.loadingMore {
+		t.Error("loadingMore should not be set when branch filter is active (j key)")
+	}
+	if cmd != nil {
+		t.Error("Should not return command when branch filter is active (j key)")
+	}
+}
+
+func TestTUIPageDownNoLoadMoreWhenBranchFiltered(t *testing.T) {
+	// Test that pgdown pagination is disabled when branch filter is active
+	m := newTuiModel("http://localhost")
+
+	m.jobs = []storage.ReviewJob{{ID: 1, Branch: "feature"}}
+	m.selectedIdx = 0
+	m.selectedJobID = 1
+	m.hasMore = true
+	m.loadingMore = false
+	m.activeBranchFilter = "feature"
+	m.currentView = tuiViewQueue
+	m.height = 20 // Ensure page size calc works
+
+	// Press pgdown at bottom - should NOT trigger load more
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	m2 := updated.(tuiModel)
+
+	if m2.loadingMore {
+		t.Error("loadingMore should not be set when branch filter is active (pgdown)")
+	}
+	if cmd != nil {
+		t.Error("Should not return command when branch filter is active (pgdown)")
+	}
+}
+
+func TestTUIWindowResizeNoLoadMoreWhenBranchFiltered(t *testing.T) {
+	// Test that window resize doesn't trigger pagination when branch filter is active
+	m := newTuiModel("http://localhost")
+
+	m.jobs = []storage.ReviewJob{{ID: 1, Branch: "feature"}}
+	m.hasMore = true
+	m.loadingMore = false
+	m.loadingJobs = false
+	m.activeBranchFilter = "feature"
+	m.currentView = tuiViewQueue
+	m.height = 10
+
+	// Resize to larger window - should NOT trigger load more
+	updated, cmd := m.Update(tea.WindowSizeMsg{Width: 120, Height: 50})
+	m2 := updated.(tuiModel)
+
+	if m2.loadingMore {
+		t.Error("loadingMore should not be set when branch filter is active (window resize)")
+	}
+	if m2.loadingJobs {
+		t.Error("loadingJobs should not be set when branch filter is active (window resize)")
+	}
+	// Window resize returns nil command when not triggering fetch
+	_ = cmd
 }
 
 func TestTUIBranchFilterTriggersRefetch(t *testing.T) {
