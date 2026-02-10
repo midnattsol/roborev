@@ -572,6 +572,12 @@ func (db *DB) migrate() error {
 		}
 	}
 
+	// Migration: add index on reviews.addressed for server-side filtering
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS idx_reviews_addressed ON reviews(addressed)`)
+	if err != nil {
+		return fmt.Errorf("create idx_reviews_addressed: %w", err)
+	}
+
 	// Run sync-related migrations
 	if err := db.migrateSyncColumns(); err != nil {
 		return err

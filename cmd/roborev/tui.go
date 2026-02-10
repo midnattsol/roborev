@@ -20,6 +20,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
+	"github.com/roborev-dev/roborev/internal/agent"
 	"github.com/roborev-dev/roborev/internal/config"
 	"github.com/roborev-dev/roborev/internal/daemon"
 	"github.com/roborev-dev/roborev/internal/git"
@@ -99,6 +100,10 @@ const (
 	tuiViewTail
 )
 
+// queuePrefetchBuffer is the number of extra rows to fetch beyond what's visible,
+// providing a buffer for smooth scrolling without needing immediate pagination.
+const queuePrefetchBuffer = 10
+
 // repoFilterItem represents a repo (or group of repos with same display name) in the filter modal
 type repoFilterItem struct {
 	name      string   // Display name. Empty string means "All repos"
@@ -117,6 +122,7 @@ type tuiModel struct {
 	daemonVersion    string
 	client           *http.Client
 	jobs             []storage.ReviewJob
+	jobStats         storage.JobStats // aggregate done/addressed/unaddressed from server
 	status           storage.DaemonStatus
 	selectedIdx      int
 	selectedJobID    int64 // Track selected job by ID to maintain position on refresh
@@ -135,11 +141,12 @@ type tuiModel struct {
 	versionMismatch  bool   // True if daemon version doesn't match TUI version
 
 	// Pagination state
-	hasMore        bool // true if there are more jobs to load
-	loadingMore    bool // true if currently loading more jobs (pagination)
-	loadingJobs    bool // true if currently loading jobs (full refresh)
-	pendingRefetch bool // true if filter changed while loading, needs refetch when done
-	heightDetected bool // true after first WindowSizeMsg (real terminal height known)
+	hasMore        bool    // true if there are more jobs to load
+	loadingMore    bool    // true if currently loading more jobs (pagination)
+	loadingJobs    bool    // true if currently loading jobs (full refresh)
+	heightDetected bool    // true after first WindowSizeMsg (real terminal height known)
+	fetchSeq       int     // incremented on filter changes; stale fetch responses are discarded
+	paginateNav    tuiView // non-zero: auto-navigate in this view after pagination loads
 
 	// Repo filter modal state
 	filterRepos       []repoFilterItem // Available repos with counts
@@ -200,6 +207,7 @@ type tuiModel struct {
 
 	// Help view state
 	helpFromView tuiView // View to return to after closing help
+	helpScroll   int     // Scroll position in help view
 
 	// Tail view state
 	tailJobID     int64      // Job being tailed
@@ -237,7 +245,9 @@ type tuiTickMsg time.Time
 type tuiJobsMsg struct {
 	jobs    []storage.ReviewJob
 	hasMore bool
-	append  bool // true to append to existing jobs, false to replace
+	append  bool             // true to append to existing jobs, false to replace
+	seq     int              // fetch sequence number — stale responses (seq < model.fetchSeq) are discarded
+	stats   storage.JobStats // aggregate counts from server
 }
 type tuiStatusMsg storage.DaemonStatus
 type tuiReviewMsg struct {
@@ -246,7 +256,10 @@ type tuiReviewMsg struct {
 	jobID      int64              // The job ID that was requested (for race condition detection)
 	branchName string             // Pre-computed branch name (empty if not applicable)
 }
-type tuiPromptMsg *storage.Review
+type tuiPromptMsg struct {
+	review *storage.Review
+	jobID  int64 // The job ID that was requested (for stale response detection)
+}
 type tuiAddressedMsg bool
 type tuiAddressedResultMsg struct {
 	jobID      int64 // job ID for queue view rollback
@@ -272,8 +285,14 @@ type tuiRerunResultMsg struct {
 	err           error
 }
 type tuiErrMsg error
-type tuiJobsErrMsg struct{ err error }       // Job fetch error (clears loadingJobs)
-type tuiPaginationErrMsg struct{ err error } // Pagination-specific error (clears loadingMore)
+type tuiJobsErrMsg struct {
+	err error
+	seq int // fetch sequence number for staleness check
+}
+type tuiPaginationErrMsg struct {
+	err error
+	seq int // fetch sequence number for staleness check
+}
 type tuiUpdateCheckMsg struct {
 	version    string // Latest version if available, empty if up to date
 	isDevBuild bool   // True if running a dev build
@@ -349,12 +368,24 @@ func newTuiModel(serverAddr string) tuiModel {
 		daemonVersion = info.Version
 	}
 
-	// Load hideAddressed preference from config
+	// Load preferences from config
 	hideAddressed := false
+	autoFilterRepo := false
 	if cfg, err := config.LoadGlobal(); err == nil {
 		hideAddressed = cfg.HideAddressedByDefault
+		autoFilterRepo = cfg.AutoFilterRepo
 	}
 	// Note: Silently ignore config load errors - TUI should work with defaults
+
+	// Auto-filter to current repo if enabled
+	var activeRepoFilter []string
+	var filterStack []string
+	if autoFilterRepo {
+		if repoRoot, err := git.GetMainRepoRoot("."); err == nil && repoRoot != "" {
+			activeRepoFilter = []string{repoRoot}
+			filterStack = []string{"repo"}
+		}
+	}
 
 	return tuiModel{
 		serverAddr:             serverAddr,
@@ -366,6 +397,8 @@ func newTuiModel(serverAddr string) tuiModel {
 		height:                 24,
 		loadingJobs:            true, // Init() calls fetchJobs, so mark as loading
 		hideAddressed:          hideAddressed,
+		activeRepoFilter:       activeRepoFilter,
+		filterStack:            filterStack,
 		displayNames:           make(map[string]string),      // Cache display names to avoid disk reads on render
 		branchNames:            make(map[int64]string),       // Cache derived branch names to avoid git calls on render
 		pendingAddressed:       make(map[int64]pendingState), // Track pending addressed changes (by job ID)
@@ -487,77 +520,107 @@ func (m tuiModel) tickInterval() time.Duration {
 }
 
 func (m tuiModel) fetchJobs() tea.Cmd {
-	// Calculate limit based on terminal height - fetch enough to fill the visible area
-	// Reserve 9 lines for header/footer, add buffer for safety
+	// Fetch enough to fill the visible area plus a buffer for smooth scrolling.
 	// Use minimum of 100 only before first WindowSizeMsg (when height is default 24)
-	visibleRows := m.height - 9 + 10
+	visibleRows := m.queueVisibleRows() + queuePrefetchBuffer
 	if !m.heightDetected {
 		visibleRows = max(100, visibleRows)
 	}
 	currentJobCount := len(m.jobs)
+	seq := m.fetchSeq
 
 	return func() tea.Msg {
-		// Determine limit:
-		// - No limit (limit=0) when filtering to show full repo/branch/addressed history
-		// - If we've paginated beyond visible area, maintain current view size
-		// - Otherwise fetch enough to fill visible area
-		var url string
+		// Build URL with server-side filters where possible, falling back to
+		// limit=0 (no pagination) only when client-side filtering is required.
+		params := neturl.Values{}
+
+		// Repo filter: single repo can use API filter; multiple repos need client-side
+		needsAllJobs := false
 		if len(m.activeRepoFilter) == 1 {
-			// Single repo filter - use API filter
-			url = fmt.Sprintf("%s/api/jobs?limit=0&repo=%s", m.serverAddr, neturl.QueryEscape(m.activeRepoFilter[0]))
+			params.Set("repo", m.activeRepoFilter[0])
 		} else if len(m.activeRepoFilter) > 1 {
-			// Multiple repos (shared display name) - fetch all, filter client-side
-			url = fmt.Sprintf("%s/api/jobs?limit=0", m.serverAddr)
-		} else if m.activeBranchFilter != "" {
-			// Fetch all jobs when filtering by branch - client-side filtering needs full dataset
-			url = fmt.Sprintf("%s/api/jobs?limit=0", m.serverAddr)
-		} else if m.hideAddressed {
-			// Fetch all jobs when hiding addressed - client-side filtering needs full dataset
-			url = fmt.Sprintf("%s/api/jobs?limit=0", m.serverAddr)
+			needsAllJobs = true // Multiple repos (shared display name) - filter client-side
+		}
+
+		// Branch filter: use server-side for real branch names.
+		// "(none)" is a client-side sentinel for empty/NULL branches and can't be
+		// sent to the server, so it falls through to client-side filtering.
+		if m.activeBranchFilter != "" && m.activeBranchFilter != "(none)" {
+			params.Set("branch", m.activeBranchFilter)
+		} else if m.activeBranchFilter == "(none)" {
+			needsAllJobs = true
+		}
+
+		// Addressed filter: use server-side to avoid fetching all jobs.
+		// Skip for client-side filtered views (needsAllJobs) so we get
+		// all jobs for accurate client-side metrics counting.
+		if m.hideAddressed && !needsAllJobs {
+			params.Set("addressed", "false")
+		}
+
+		// Set limit: use pagination unless we need client-side filtering (multi-repo)
+		if needsAllJobs {
+			params.Set("limit", "0")
 		} else {
 			limit := visibleRows
 			if currentJobCount > visibleRows {
 				limit = currentJobCount // Maintain paginated view on refresh
 			}
-			url = fmt.Sprintf("%s/api/jobs?limit=%d", m.serverAddr, limit)
+			params.Set("limit", fmt.Sprintf("%d", limit))
 		}
+
+		url := fmt.Sprintf("%s/api/jobs?%s", m.serverAddr, params.Encode())
 		resp, err := m.client.Get(url)
 		if err != nil {
-			return tuiJobsErrMsg{err: err}
+			return tuiJobsErrMsg{err: err, seq: seq}
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			return tuiJobsErrMsg{err: fmt.Errorf("fetch jobs: %s", resp.Status)}
+			return tuiJobsErrMsg{err: fmt.Errorf("fetch jobs: %s", resp.Status), seq: seq}
 		}
 
 		var result struct {
 			Jobs    []storage.ReviewJob `json:"jobs"`
 			HasMore bool                `json:"has_more"`
+			Stats   storage.JobStats    `json:"stats"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return tuiJobsErrMsg{err: err}
+			return tuiJobsErrMsg{err: err, seq: seq}
 		}
-		return tuiJobsMsg{jobs: result.Jobs, hasMore: result.HasMore, append: false}
+		return tuiJobsMsg{jobs: result.Jobs, hasMore: result.HasMore, append: false, seq: seq, stats: result.Stats}
 	}
 }
 
 func (m tuiModel) fetchMoreJobs() tea.Cmd {
+	seq := m.fetchSeq
 	return func() tea.Msg {
-		// Only fetch more when not filtering (filtered view loads all)
-		if len(m.activeRepoFilter) > 0 || m.activeBranchFilter != "" {
-			return nil
+		// Only fetch more when not doing client-side filtering that loads all jobs
+		if len(m.activeRepoFilter) > 1 || m.activeBranchFilter == "(none)" {
+			return nil // Multi-repo or "(none)" branch filter loads everything
 		}
 		offset := len(m.jobs)
-		url := fmt.Sprintf("%s/api/jobs?limit=50&offset=%d", m.serverAddr, offset)
+		params := neturl.Values{}
+		params.Set("limit", "50")
+		params.Set("offset", fmt.Sprintf("%d", offset))
+		if len(m.activeRepoFilter) == 1 {
+			params.Set("repo", m.activeRepoFilter[0])
+		}
+		if m.activeBranchFilter != "" && m.activeBranchFilter != "(none)" {
+			params.Set("branch", m.activeBranchFilter)
+		}
+		if m.hideAddressed {
+			params.Set("addressed", "false")
+		}
+		url := fmt.Sprintf("%s/api/jobs?%s", m.serverAddr, params.Encode())
 		resp, err := m.client.Get(url)
 		if err != nil {
-			return tuiPaginationErrMsg{err: err}
+			return tuiPaginationErrMsg{err: err, seq: seq}
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			return tuiPaginationErrMsg{err: fmt.Errorf("fetch more jobs: %s", resp.Status)}
+			return tuiPaginationErrMsg{err: fmt.Errorf("fetch more jobs: %s", resp.Status), seq: seq}
 		}
 
 		var result struct {
@@ -565,9 +628,9 @@ func (m tuiModel) fetchMoreJobs() tea.Cmd {
 			HasMore bool                `json:"has_more"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return tuiPaginationErrMsg{err: err}
+			return tuiPaginationErrMsg{err: err, seq: seq}
 		}
-		return tuiJobsMsg{jobs: result.Jobs, hasMore: result.HasMore, append: true}
+		return tuiJobsMsg{jobs: result.Jobs, hasMore: result.HasMore, append: true, seq: seq}
 	}
 }
 
@@ -622,8 +685,9 @@ func (m tuiModel) fetchRepos() tea.Cmd {
 
 	return func() tea.Msg {
 		// Build URL with optional branch filter (URL-encoded)
+		// Skip sending branch when "(none)" sentinel - it's a client-side filter
 		reposURL := serverAddr + "/api/repos"
-		if activeBranchFilter != "" {
+		if activeBranchFilter != "" && activeBranchFilter != "(none)" {
 			params := neturl.Values{}
 			params.Set("branch", activeBranchFilter)
 			reposURL += "?" + params.Encode()
@@ -931,7 +995,7 @@ func (m tuiModel) fetchReviewForPrompt(jobID int64) tea.Cmd {
 		if err := json.NewDecoder(resp.Body).Decode(&review); err != nil {
 			return tuiErrMsg(err)
 		}
-		return tuiPromptMsg(&review)
+		return tuiPromptMsg{review: &review, jobID: jobID}
 	}
 }
 
@@ -1320,6 +1384,32 @@ func (m *tuiModel) findPrevViewableJob() int {
 	return -1
 }
 
+// findNextPromptableJob finds the next job that has a viewable prompt (done or running with prompt).
+// Respects active filters. Returns the index or -1 if none found.
+func (m *tuiModel) findNextPromptableJob() int {
+	for i := m.selectedIdx + 1; i < len(m.jobs); i++ {
+		job := m.jobs[i]
+		if m.isJobVisible(job) &&
+			(job.Status == storage.JobStatusDone || (job.Status == storage.JobStatusRunning && job.Prompt != "")) {
+			return i
+		}
+	}
+	return -1
+}
+
+// findPrevPromptableJob finds the previous job that has a viewable prompt (done or running with prompt).
+// Respects active filters. Returns the index or -1 if none found.
+func (m *tuiModel) findPrevPromptableJob() int {
+	for i := m.selectedIdx - 1; i >= 0; i-- {
+		job := m.jobs[i]
+		if m.isJobVisible(job) &&
+			(job.Status == storage.JobStatusDone || (job.Status == storage.JobStatusRunning && job.Prompt != "")) {
+			return i
+		}
+	}
+	return -1
+}
+
 // normalizeSelectionIfHidden adjusts selectedIdx/selectedJobID if the current
 // selection is hidden (e.g., marked addressed with hideAddressed filter active).
 // Call this when returning to queue view from review view.
@@ -1577,6 +1667,25 @@ func (m tuiModel) getVisibleJobs() []storage.ReviewJob {
 	return visible
 }
 
+// queueVisibleRows returns how many queue rows fit in the current terminal.
+func (m tuiModel) queueVisibleRows() int {
+	// Keep in sync with renderQueueView reserved lines.
+	const reservedLines = 8
+	visibleRows := m.height - reservedLines
+	if visibleRows < 3 {
+		visibleRows = 3
+	}
+	return visibleRows
+}
+
+// canPaginate returns true if more jobs can be loaded via pagination.
+// False when already loading, using client-side filters that load all jobs,
+// or when there are no more jobs to fetch.
+func (m tuiModel) canPaginate() bool {
+	return m.hasMore && !m.loadingMore && !m.loadingJobs &&
+		len(m.activeRepoFilter) <= 1 && m.activeBranchFilter != "(none)"
+}
+
 // getVisibleSelectedIdx returns the index within visible jobs for the current selection
 // Returns -1 if selectedIdx is -1 or doesn't match any visible job
 func (m tuiModel) getVisibleSelectedIdx() int {
@@ -1717,6 +1826,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.selectedIdx = -1
 					m.selectedJobID = 0
 					// Refetch jobs with the new filter applied at the API level
+					m.fetchSeq++
 					m.loadingJobs = true
 					return m, m.fetchJobs()
 				}
@@ -1773,14 +1883,11 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.branchFilterSearch = ""
 					// Branch filter changes fetch behavior (limited vs unlimited),
 					// so we need to refetch
-					m.jobs = nil
+					// Keep m.jobs so fetchJobs requests at least len(m.jobs) rows
 					m.hasMore = false
 					m.selectedIdx = -1
 					m.selectedJobID = 0
-					if m.loadingJobs || m.loadingMore {
-						m.pendingRefetch = true
-						return m, nil
-					}
+					m.fetchSeq++
 					m.loadingJobs = true
 					return m, m.fetchJobs()
 				}
@@ -1898,6 +2005,11 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.tailScroll = 0
 				}
 				return m, tea.ClearScreen
+			case "?":
+				m.helpFromView = m.currentView
+				m.currentView = tuiViewHelp
+				m.helpScroll = 0
+				return m, nil
 			}
 			return m, nil
 		}
@@ -1908,11 +2020,13 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentView = tuiViewQueue
 				m.currentReview = nil
 				m.reviewScroll = 0
+				m.paginateNav = 0
 				m.normalizeSelectionIfHidden()
 				return m, nil
 			}
 			if m.currentView == tuiViewPrompt {
 				// Go back to where we came from
+				m.paginateNav = 0
 				if m.promptFromQueue {
 					m.currentView = tuiViewQueue
 					m.currentReview = nil
@@ -1948,6 +2062,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.promptScroll = 0
 			} else if m.currentView == tuiViewCommitMsg {
 				m.commitMsgScroll = 0
+			} else if m.currentView == tuiViewHelp {
+				m.helpScroll = 0
 			}
 
 		case "up":
@@ -1973,6 +2089,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.currentView == tuiViewCommitMsg {
 				if m.commitMsgScroll > 0 {
 					m.commitMsgScroll--
+				}
+			} else if m.currentView == tuiViewHelp {
+				if m.helpScroll > 0 {
+					m.helpScroll--
 				}
 			}
 
@@ -2008,8 +2128,26 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.flashView = tuiViewReview
 				}
 			} else if m.currentView == tuiViewPrompt {
-				if m.promptScroll > 0 {
-					m.promptScroll--
+				// Navigate to previous review's prompt (lower index)
+				prevIdx := m.findPrevPromptableJob()
+				if prevIdx >= 0 {
+					m.selectedIdx = prevIdx
+					m.updateSelectedJobID()
+					m.promptScroll = 0
+					job := m.jobs[prevIdx]
+					if job.Status == storage.JobStatusDone {
+						return m, m.fetchReviewForPrompt(job.ID)
+					} else if job.Status == storage.JobStatusRunning && job.Prompt != "" {
+						m.currentReview = &storage.Review{
+							Agent:  job.Agent,
+							Prompt: job.Prompt,
+							Job:    &job,
+						}
+					}
+				} else {
+					m.flashMessage = "No newer review"
+					m.flashExpiresAt = time.Now().Add(2 * time.Second)
+					m.flashView = tuiViewPrompt
 				}
 			}
 
@@ -2020,12 +2158,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if nextIdx >= 0 {
 					m.selectedIdx = nextIdx
 					m.updateSelectedJobID()
-				} else if m.hasMore && !m.loadingMore && !m.loadingJobs && len(m.activeRepoFilter) == 0 && m.activeBranchFilter == "" {
+				} else if m.canPaginate() {
 					// At bottom with more jobs available - load them
 					m.loadingMore = true
 					return m, m.fetchMoreJobs()
-				} else if !m.hasMore || len(m.activeRepoFilter) > 0 || m.activeBranchFilter != "" {
-					// Truly at the bottom - no more to load or filter prevents auto-load
+				} else if !m.hasMore || len(m.activeRepoFilter) > 1 {
+					// Truly at the bottom - no more to load or multi-repo filter prevents auto-load
 					m.flashMessage = "No older review"
 					m.flashExpiresAt = time.Now().Add(2 * time.Second)
 					m.flashView = tuiViewQueue
@@ -2036,6 +2174,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.promptScroll++
 			} else if m.currentView == tuiViewCommitMsg {
 				m.commitMsgScroll++
+			} else if m.currentView == tuiViewHelp {
+				m.helpScroll = min(m.helpScroll+1, m.helpMaxScroll())
 			}
 
 		case "j", "left":
@@ -2045,7 +2185,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if nextIdx >= 0 {
 					m.selectedIdx = nextIdx
 					m.updateSelectedJobID()
-				} else if m.hasMore && !m.loadingMore && !m.loadingJobs && len(m.activeRepoFilter) == 0 && m.activeBranchFilter == "" {
+				} else if m.canPaginate() {
 					// At bottom with more jobs available - load them
 					m.loadingMore = true
 					return m, m.fetchMoreJobs()
@@ -2068,13 +2208,41 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							Job:    &job,
 						}
 					}
+				} else if m.canPaginate() {
+					m.loadingMore = true
+					m.paginateNav = tuiViewReview
+					return m, m.fetchMoreJobs()
 				} else {
 					m.flashMessage = "No older review"
 					m.flashExpiresAt = time.Now().Add(2 * time.Second)
 					m.flashView = tuiViewReview
 				}
 			} else if m.currentView == tuiViewPrompt {
-				m.promptScroll++
+				// Navigate to next review's prompt (higher index)
+				nextIdx := m.findNextPromptableJob()
+				if nextIdx >= 0 {
+					m.selectedIdx = nextIdx
+					m.updateSelectedJobID()
+					m.promptScroll = 0
+					job := m.jobs[nextIdx]
+					if job.Status == storage.JobStatusDone {
+						return m, m.fetchReviewForPrompt(job.ID)
+					} else if job.Status == storage.JobStatusRunning && job.Prompt != "" {
+						m.currentReview = &storage.Review{
+							Agent:  job.Agent,
+							Prompt: job.Prompt,
+							Job:    &job,
+						}
+					}
+				} else if m.canPaginate() {
+					m.loadingMore = true
+					m.paginateNav = tuiViewPrompt
+					return m, m.fetchMoreJobs()
+				} else {
+					m.flashMessage = "No older review"
+					m.flashExpiresAt = time.Now().Add(2 * time.Second)
+					m.flashView = tuiViewPrompt
+				}
 			}
 
 		case "pgup":
@@ -2095,6 +2263,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.currentView == tuiViewPrompt {
 				m.promptScroll = max(0, m.promptScroll-pageSize)
 				return m, tea.ClearScreen
+			} else if m.currentView == tuiViewHelp {
+				m.helpScroll = max(0, m.helpScroll-pageSize)
 			}
 
 		case "pgdown":
@@ -2112,7 +2282,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.updateSelectedJobID()
 				// If we hit the end, try to load more
-				if reachedEnd && m.hasMore && !m.loadingMore && !m.loadingJobs && len(m.activeRepoFilter) == 0 && m.activeBranchFilter == "" {
+				if reachedEnd && m.canPaginate() {
 					m.loadingMore = true
 					return m, m.fetchMoreJobs()
 				}
@@ -2122,6 +2292,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.currentView == tuiViewPrompt {
 				m.promptScroll += pageSize
 				return m, tea.ClearScreen
+			} else if m.currentView == tuiViewHelp {
+				m.helpScroll = min(m.helpScroll+pageSize, m.helpMaxScroll())
 			}
 
 		case "enter":
@@ -2334,10 +2506,11 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.updateSelectedJobID()
 					}
 				}
-				if m.hideAddressed {
-					// Fetch all jobs when enabling filter (need full dataset for client-side filtering)
-					return m, m.fetchJobs()
-				}
+				// Re-fetch: enabling adds server-side filter, disabling needs
+				// unfiltered data that may not be in current result set
+				m.fetchSeq++
+				m.loadingJobs = true
+				return m, m.fetchJobs()
 			}
 
 		case "c":
@@ -2432,9 +2605,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentView = m.helpFromView
 				return m, nil
 			}
-			if m.currentView == tuiViewQueue || m.currentView == tuiViewReview {
+			if m.currentView == tuiViewQueue || m.currentView == tuiViewReview || m.currentView == tuiViewPrompt || m.currentView == tuiViewTail {
 				m.helpFromView = m.currentView
 				m.currentView = tuiViewHelp
+				m.helpScroll = 0
 				return m, nil
 			}
 
@@ -2444,14 +2618,11 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				popped := m.popFilter()
 				if popped == "repo" || popped == "branch" {
 					// Repo/branch filter changes fetch behavior, need to refetch
-					m.jobs = nil
+					// Keep m.jobs so fetchJobs requests at least len(m.jobs) rows
 					m.hasMore = false
 					m.selectedIdx = -1
 					m.selectedJobID = 0
-					if m.loadingJobs || m.loadingMore {
-						m.pendingRefetch = true
-						return m, nil
-					}
+					m.fetchSeq++
 					m.loadingJobs = true
 					return m, m.fetchJobs()
 				}
@@ -2459,22 +2630,18 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.currentView == tuiViewQueue && m.hideAddressed {
 				// Clear hide-addressed filter (no project/branch filter active)
 				m.hideAddressed = false
-				m.jobs = nil
+				// Keep m.jobs so fetchJobs requests at least len(m.jobs) rows
 				m.hasMore = false
 				m.selectedIdx = -1
 				m.selectedJobID = 0
-				// If already loading (full refresh or pagination), queue a refetch
-				// to avoid out-of-order responses mixing stale data
-				if m.loadingJobs || m.loadingMore {
-					m.pendingRefetch = true
-					return m, nil
-				}
+				m.fetchSeq++
 				m.loadingJobs = true
 				return m, m.fetchJobs()
 			} else if m.currentView == tuiViewReview {
 				m.currentView = tuiViewQueue
 				m.currentReview = nil
 				m.reviewScroll = 0
+				m.paginateNav = 0
 				m.normalizeSelectionIfHidden()
 				// If hiding addressed, trigger refresh to ensure clean state
 				// (avoids timing issues where addressed job briefly appears)
@@ -2484,6 +2651,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			} else if m.currentView == tuiViewPrompt {
 				// Go back to where we came from
+				m.paginateNav = 0
 				if m.promptFromQueue {
 					m.currentView = tuiViewQueue
 					m.currentReview = nil
@@ -2510,8 +2678,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// If terminal can show more jobs than we have, re-fetch to fill screen
 		// Gate on !loadingMore and !loadingJobs to avoid race conditions
-		if !m.loadingMore && !m.loadingJobs && len(m.jobs) > 0 && m.hasMore && len(m.activeRepoFilter) == 0 && m.activeBranchFilter == "" {
-			newVisibleRows := m.height - 9 + 10
+		if !m.loadingMore && !m.loadingJobs && len(m.jobs) > 0 && m.hasMore && len(m.activeRepoFilter) <= 1 {
+			newVisibleRows := m.queueVisibleRows() + queuePrefetchBuffer
 			if newVisibleRows > len(m.jobs) {
 				m.loadingJobs = true
 				return m, m.fetchJobs()
@@ -2535,21 +2703,31 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tuiJobsMsg:
-		m.loadingMore = false
+		// Discard stale responses from before a filter change.
+		// Clear loadingMore since the old pagination request is done (even though stale).
+		// Do NOT clear loadingJobs - the replacement fetch is still in flight.
+		if msg.seq < m.fetchSeq {
+			m.paginateNav = 0
+			m.loadingMore = false
+			return m, nil
+		}
+
+		// Only clear loadingMore on append (pagination complete) or when no
+		// pagination navigation is pending. Keeping loadingMore=true while
+		// paginateNav is set prevents ticks from starting new refreshes
+		// that would race and clear paginateNav.
+		if msg.append || m.paginateNav == 0 {
+			m.loadingMore = false
+		}
 		if !msg.append {
 			m.loadingJobs = false
 		}
 		m.consecutiveErrors = 0 // Reset on successful fetch
 
-		// If filter changed while this fetch was in flight, discard stale data
-		// and trigger a fresh fetch with the current filter state
-		if m.pendingRefetch {
-			m.pendingRefetch = false
-			m.loadingJobs = true
-			return m, m.fetchJobs()
-		}
-
 		m.hasMore = msg.hasMore
+		if !msg.append {
+			m.jobStats = msg.stats
+		}
 
 		// Update display name cache for new jobs
 		m.updateDisplayNameCache(msg.jobs)
@@ -2669,6 +2847,65 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// With hide-addressed enabled we also hide failed/canceled jobs
+		// client-side, so a server page can underfill the viewport.
+		// Automatically paginate until we can fill visible rows or exhaust data.
+		if m.currentView == tuiViewQueue &&
+			m.hideAddressed &&
+			m.canPaginate() &&
+			len(m.getVisibleJobs()) < m.queueVisibleRows() {
+			m.loadingMore = true
+			return m, m.fetchMoreJobs()
+		}
+
+		// Auto-navigate after pagination triggered from review/prompt view.
+		// Only on append (pagination) responses, not full refreshes.
+		if msg.append && m.paginateNav != 0 && m.currentView == m.paginateNav {
+			nav := m.paginateNav
+			m.paginateNav = 0
+			if nav == tuiViewReview {
+				nextIdx := m.findNextViewableJob()
+				if nextIdx >= 0 {
+					m.selectedIdx = nextIdx
+					m.updateSelectedJobID()
+					m.reviewScroll = 0
+					job := m.jobs[nextIdx]
+					if job.Status == storage.JobStatusDone {
+						return m, m.fetchReview(job.ID)
+					} else if job.Status == storage.JobStatusFailed {
+						m.currentBranch = ""
+						m.currentReview = &storage.Review{
+							Agent:  job.Agent,
+							Output: "Job failed:\n\n" + job.Error,
+							Job:    &job,
+						}
+					}
+				}
+			} else if nav == tuiViewPrompt {
+				nextIdx := m.findNextPromptableJob()
+				if nextIdx >= 0 {
+					m.selectedIdx = nextIdx
+					m.updateSelectedJobID()
+					m.promptScroll = 0
+					job := m.jobs[nextIdx]
+					if job.Status == storage.JobStatusDone {
+						return m, m.fetchReviewForPrompt(job.ID)
+					} else if job.Status == storage.JobStatusRunning && job.Prompt != "" {
+						m.currentReview = &storage.Review{
+							Agent:  job.Agent,
+							Prompt: job.Prompt,
+							Job:    &job,
+						}
+					}
+				}
+			}
+		} else if !msg.append && !m.loadingMore {
+			// Clear paginateNav on non-append (refresh) responses when no
+			// pagination is in flight. If loadingMore is still set (pagination
+			// pending), preserve intent for the append response.
+			m.paginateNav = 0
+		}
+
 	case tuiStatusMsg:
 		m.status = storage.DaemonStatus(msg)
 		m.consecutiveErrors = 0 // Reset on successful fetch
@@ -2704,8 +2941,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.reviewScroll = 0
 
 	case tuiPromptMsg:
+		// Ignore stale responses from rapid navigation
+		if msg.jobID != m.selectedJobID {
+			return m, nil
+		}
 		m.consecutiveErrors = 0 // Reset on successful fetch
-		m.currentReview = msg
+		m.currentReview = msg.review
 		m.currentView = tuiViewPrompt
 		m.promptScroll = 0
 
@@ -2904,19 +3145,16 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.currentView = tuiViewCommitMsg
 
 	case tuiJobsErrMsg:
+		// Discard stale error responses from superseded fetches
+		if msg.seq < m.fetchSeq {
+			return m, nil
+		}
 		m.err = msg.err
 		m.loadingJobs = false // Clear loading state so refreshes can resume
 
 		// Only count connection errors for reconnection (not 404s, parse errors, etc.)
 		if isConnectionError(msg.err) {
 			m.consecutiveErrors++
-		}
-
-		// If filter changed while loading, retry immediately with current filter state
-		if m.pendingRefetch {
-			m.pendingRefetch = false
-			m.loadingJobs = true
-			return m, m.fetchJobs()
 		}
 
 		// Try to reconnect after consecutive connection failures
@@ -2926,19 +3164,20 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tuiPaginationErrMsg:
+		// Discard stale error responses from superseded fetches.
+		// Still clear pagination state so loadingMore doesn't get stuck.
+		if msg.seq < m.fetchSeq {
+			m.loadingMore = false
+			m.paginateNav = 0
+			return m, nil
+		}
 		m.err = msg.err
 		m.loadingMore = false // Clear loading state so user can retry pagination
+		m.paginateNav = 0
 
 		// Only count connection errors for reconnection
 		if isConnectionError(msg.err) {
 			m.consecutiveErrors++
-		}
-
-		// If filter changed while pagination was in flight, trigger fresh fetch
-		if m.pendingRefetch {
-			m.pendingRefetch = false
-			m.loadingJobs = true
-			return m, m.fetchJobs()
 		}
 
 		// Try to reconnect after consecutive connection failures
@@ -3032,25 +3271,34 @@ func (m tuiModel) renderQueueView() string {
 	b.WriteString(tuiTitleStyle.Render(title))
 	b.WriteString("\x1b[K\n") // Clear to end of line
 
-	// Status line - count addressed/unaddressed from jobs
+	// Status line - use server-side aggregate counts for paginated views,
+	// fall back to client-side counting for multi-repo filters (which load all jobs)
 	var statusLine string
 	var done, addressed, unaddressed int
-	for _, job := range m.jobs {
-		if len(m.activeRepoFilter) > 0 || m.activeBranchFilter != "" {
-			if !m.repoMatchesFilter(job.RepoPath) {
+	if len(m.activeRepoFilter) > 1 || m.activeBranchFilter == "(none)" {
+		// Client-side filtered views load all jobs, so count locally
+		for _, job := range m.jobs {
+			if len(m.activeRepoFilter) > 0 && !m.repoMatchesFilter(job.RepoPath) {
 				continue
 			}
-		}
-		if job.Status == storage.JobStatusDone {
-			done++
-			if job.Addressed != nil {
-				if *job.Addressed {
-					addressed++
-				} else {
-					unaddressed++
+			if m.activeBranchFilter == "(none)" && job.Branch != "" {
+				continue
+			}
+			if job.Status == storage.JobStatusDone {
+				done++
+				if job.Addressed != nil {
+					if *job.Addressed {
+						addressed++
+					} else {
+						unaddressed++
+					}
 				}
 			}
 		}
+	} else {
+		done = m.jobStats.Done
+		addressed = m.jobStats.Addressed
+		unaddressed = m.jobStats.Unaddressed
 	}
 	if len(m.activeRepoFilter) > 0 || m.activeBranchFilter != "" {
 		statusLine = fmt.Sprintf("Daemon: %s | Done: %d | Addressed: %d | Unaddressed: %d",
@@ -3081,8 +3329,8 @@ func (m tuiModel) renderQueueView() string {
 	visibleSelectedIdx := m.getVisibleSelectedIdx()
 
 	// Calculate visible job range based on terminal height
-	// Reserve lines for: title(1) + status(2) + header(2) + scroll indicator(1) + status/update(1) + help(2)
-	reservedLines := 9
+	// Reserve lines for: title(1) + status(2) + header(2) + scroll indicator(1) + status/update(1) + help(1)
+	reservedLines := 8
 	visibleRows := m.height - reservedLines
 	if visibleRows < 3 {
 		visibleRows = 3 // Show at least 3 jobs
@@ -3094,7 +3342,7 @@ func (m tuiModel) renderQueueView() string {
 	end := 0
 
 	if len(visibleJobList) == 0 {
-		if m.loadingJobs || m.loadingMore || m.pendingRefetch {
+		if m.loadingJobs || m.loadingMore {
 			b.WriteString("Loading...")
 			b.WriteString("\x1b[K\n")
 		} else if len(m.activeRepoFilter) > 0 || m.hideAddressed {
@@ -3186,7 +3434,7 @@ func (m tuiModel) renderQueueView() string {
 		if len(visibleJobList) > visibleRows || m.hasMore || m.loadingMore {
 			if m.loadingMore {
 				scrollInfo = fmt.Sprintf("[showing %d-%d of %d] Loading more...", start+1, end, len(visibleJobList))
-			} else if m.hasMore && len(m.activeRepoFilter) == 0 && m.activeBranchFilter == "" {
+			} else if m.hasMore && len(m.activeRepoFilter) <= 1 {
 				scrollInfo = fmt.Sprintf("[showing %d-%d of %d+] scroll down to load more", start+1, end, len(visibleJobList))
 			} else if len(visibleJobList) > visibleRows {
 				scrollInfo = fmt.Sprintf("[showing %d-%d of %d]", start+1, end, len(visibleJobList))
@@ -3211,15 +3459,9 @@ func (m tuiModel) renderQueueView() string {
 	}
 	b.WriteString("\x1b[K\n") // Clear to end of line
 
-	// Help (two lines)
-	helpLine1 := "↑/↓: navigate | g: top | enter: review | y: copy | m: commit msg"
-	helpLine2 := "f: filter | b: branch | h: hide addressed | a: toggle addressed | x: cancel | q: quit | ?: help"
-	if len(m.activeRepoFilter) > 0 || m.activeBranchFilter != "" || m.hideAddressed {
-		helpLine2 += " | esc: clear filters"
-	}
-	b.WriteString(tuiHelpStyle.Render(helpLine1))
-	b.WriteString("\x1b[K\n") // Clear to end of line
-	b.WriteString(tuiHelpStyle.Render(helpLine2))
+	// Help
+	helpLine := "↑/↓: navigate | enter: review | a: addressed | f: filter | h: hide | ?: help | q: quit"
+	b.WriteString(tuiHelpStyle.Render(helpLine))
 	b.WriteString("\x1b[K") // Clear to end of line (no newline at end)
 	b.WriteString("\x1b[J") // Clear to end of screen to prevent artifacts
 
@@ -3397,8 +3639,41 @@ func (m tuiModel) renderJobLine(job storage.ReviewJob, selected bool, idWidth in
 		styledStatus, verdict, enqueued, elapsed, addr)
 }
 
+// commandLineForJob computes the representative agent command line from job parameters.
+// Returns empty string if the agent is not available.
+func commandLineForJob(job *storage.ReviewJob) string {
+	if job == nil {
+		return ""
+	}
+	a, err := agent.Get(job.Agent)
+	if err != nil {
+		return ""
+	}
+	reasoning := strings.ToLower(strings.TrimSpace(job.Reasoning))
+	if reasoning == "" {
+		reasoning = "thorough"
+	}
+	cmd := a.WithReasoning(agent.ParseReasoningLevel(reasoning)).WithAgentic(job.Agentic).WithModel(job.Model).CommandLine()
+	return stripControlChars(cmd)
+}
+
+// stripControlChars removes all control characters including C0 (\x00-\x1f),
+// DEL (\x7f), and C1 (\x80-\x9f) from a string to prevent terminal escape
+// injection and line/tab spoofing in single-line display contexts.
+func stripControlChars(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // wrapText wraps text to the specified width, preserving existing line breaks
-// and breaking at word boundaries when possible
+// and breaking at word boundaries when possible.
 func wrapText(text string, width int) []string {
 	if width <= 0 {
 		width = 100
@@ -3534,7 +3809,7 @@ func (m tuiModel) renderReviewView() string {
 	}
 
 	// Help text wraps at narrow terminals
-	const helpText = "↑/↓: scroll | j/k: prev/next | a: addressed | y: copy | m: commit msg | ?: help | esc/q: back"
+	const helpText = "↑/↓: scroll | ←/→: prev/next | a: addressed | y: copy | ?: help | esc: back"
 	helpLines := 1
 	if m.width > 0 && m.width < len(helpText) {
 		helpLines = (len(helpText) + m.width - 1) / m.width
@@ -3610,26 +3885,36 @@ func (m tuiModel) renderReviewView() string {
 func (m tuiModel) renderPromptView() string {
 	var b strings.Builder
 
-	// Clear screen and move cursor to home position to prevent artifacts on scroll
-	b.WriteString("\x1b[2J\x1b[H")
-
 	review := m.currentReview
 	if review.Job != nil {
 		ref := shortJobRef(*review.Job)
+		idStr := fmt.Sprintf("#%d ", review.Job.ID)
 		agentStr := formatAgentLabel(review.Agent, review.Job.Model)
-		title := fmt.Sprintf("Prompt: %s (%s)", ref, agentStr)
+		title := fmt.Sprintf("Prompt %s%s (%s)", idStr, ref, agentStr)
 		b.WriteString(tuiTitleStyle.Render(title))
 	} else {
 		b.WriteString(tuiTitleStyle.Render("Prompt"))
 	}
 	b.WriteString("\x1b[K\n") // Clear to end of line
 
+	// Show command line (computed from job params, dimmed, below title, truncated to fit)
+	headerLines := 1
+	if cmdLine := commandLineForJob(review.Job); cmdLine != "" {
+		cmdText := "Command: " + cmdLine
+		if m.width > 0 && runewidth.StringWidth(cmdText) > m.width {
+			cmdText = runewidth.Truncate(cmdText, m.width, "…")
+		}
+		b.WriteString(tuiStatusStyle.Render(cmdText))
+		b.WriteString("\x1b[K\n")
+		headerLines++
+	}
+
 	// Wrap text to terminal width minus padding
 	wrapWidth := max(20, min(m.width-4, 200))
 	lines := wrapText(review.Prompt, wrapWidth)
 
-	// Reserve: title(1) + scroll indicator(1) + help(1) + margin(1)
-	visibleLines := m.height - 4
+	// Reserve: title(1) + command(0-1) + scroll indicator(1) + help(1) + margin(1)
+	visibleLines := m.height - 3 - headerLines
 	if visibleLines < 1 {
 		visibleLines = 1
 	}
@@ -3668,7 +3953,7 @@ func (m tuiModel) renderPromptView() string {
 	}
 	b.WriteString("\x1b[K\n") // Clear scroll indicator line
 
-	b.WriteString(tuiHelpStyle.Render("up/down: scroll | p: back to review | esc/q: back"))
+	b.WriteString(tuiHelpStyle.Render("↑/↓: scroll | ←/→: prev/next | p: toggle prompt/review | ?: help | esc: back"))
 	b.WriteString("\x1b[K") // Clear help line
 	b.WriteString("\x1b[J") // Clear to end of screen to prevent artifacts
 
@@ -4213,39 +4498,32 @@ func (m tuiModel) renderTailView() string {
 	return b.String()
 }
 
-func (m tuiModel) renderHelpView() string {
-	var b strings.Builder
-
-	b.WriteString(tuiTitleStyle.Render("Keyboard Shortcuts"))
-	b.WriteString("\x1b[K\n\x1b[K\n")
-
-	// Define shortcuts in groups
+// helpLines builds the help content lines from shortcut definitions.
+func helpLines() []string {
 	shortcuts := []struct {
 		group string
 		keys  []struct{ key, desc string }
 	}{
 		{
-			group: "Navigation",
+			group: "Queue View",
 			keys: []struct{ key, desc string }{
-				{"↑/k", "Move up / previous review"},
-				{"↓/j", "Move down / next review"},
+				{"↑/k, ↓/j", "Navigate jobs"},
 				{"g/Home", "Jump to top"},
-				{"PgUp/PgDn", "Scroll by page"},
-				{"enter", "View review details"},
-				{"esc", "Go back / clear filter"},
-				{"q", "Quit"},
+				{"PgUp/PgDn", "Page through list"},
+				{"enter", "View review"},
+				{"p", "View prompt"},
+				{"t", "Tail running job output"},
+				{"m", "View commit message"},
 			},
 		},
 		{
 			group: "Actions",
 			keys: []struct{ key, desc string }{
-				{"a", "Mark as addressed"},
+				{"a", "Toggle addressed"},
 				{"c", "Add comment"},
-				{"t", "Tail running job output"},
-				{"x", "Cancel job"},
-				{"r", "Re-run job"},
 				{"y", "Copy review to clipboard"},
-				{"m", "Show commit message(s)"},
+				{"x", "Cancel running/queued job"},
+				{"r", "Re-run completed/failed job"},
 			},
 		},
 		{
@@ -4253,51 +4531,119 @@ func (m tuiModel) renderHelpView() string {
 			keys: []struct{ key, desc string }{
 				{"f", "Filter by repository"},
 				{"b", "Filter by branch"},
-				{"h", "Toggle hide addressed"},
+				{"h", "Toggle hide addressed/failed"},
+				{"esc", "Clear filters (one at a time)"},
 			},
 		},
 		{
 			group: "Review View",
 			keys: []struct{ key, desc string }{
-				{"p", "View prompt"},
 				{"↑/↓", "Scroll content"},
 				{"←/→", "Previous / next review"},
+				{"PgUp/PgDn", "Page through content"},
+				{"p", "Switch to prompt view"},
+				{"a", "Toggle addressed"},
+				{"c", "Add comment"},
+				{"y", "Copy review to clipboard"},
+				{"m", "View commit message"},
+				{"esc/q", "Back to queue"},
+			},
+		},
+		{
+			group: "Prompt View",
+			keys: []struct{ key, desc string }{
+				{"↑/↓", "Scroll content"},
+				{"←/→", "Previous / next prompt"},
+				{"PgUp/PgDn", "Page through content"},
+				{"p", "Switch to review / back to queue"},
+				{"esc/q", "Back to queue"},
+			},
+		},
+		{
+			group: "Tail View",
+			keys: []struct{ key, desc string }{
+				{"↑/↓", "Scroll output"},
+				{"PgUp/PgDn", "Page through output"},
+				{"g", "Toggle follow mode / jump to top"},
+				{"x", "Cancel job"},
+				{"esc/q", "Back to queue"},
+			},
+		},
+		{
+			group: "General",
+			keys: []struct{ key, desc string }{
+				{"?", "Toggle this help"},
+				{"q", "Quit (from queue view)"},
 			},
 		},
 	}
 
-	// Calculate visible area
-	// Reserve: title(1) + blank(1) + padding + help(1)
+	var lines []string
+	for i, g := range shortcuts {
+		lines = append(lines, "\x00group:"+g.group)
+		for _, k := range g.keys {
+			lines = append(lines, fmt.Sprintf("  %-14s %s", k.key, k.desc))
+		}
+		if i < len(shortcuts)-1 {
+			lines = append(lines, "")
+		}
+	}
+	return lines
+}
+
+// helpMaxScroll returns the maximum scroll offset for the help view.
+func (m tuiModel) helpMaxScroll() int {
+	reservedLines := 3 // title + blank + help hint
+	visibleLines := m.height - reservedLines
+	if visibleLines < 5 {
+		visibleLines = 5
+	}
+	maxScroll := len(helpLines()) - visibleLines
+	if maxScroll < 0 {
+		return 0
+	}
+	return maxScroll
+}
+
+func (m tuiModel) renderHelpView() string {
+	var b strings.Builder
+
+	b.WriteString(tuiTitleStyle.Render("Keyboard Shortcuts"))
+	b.WriteString("\x1b[K\n\x1b[K\n")
+
+	allLines := helpLines()
+
+	// Calculate visible area: title(1) + blank(1) + help(1)
 	reservedLines := 3
 	visibleLines := m.height - reservedLines
 	if visibleLines < 5 {
 		visibleLines = 5
 	}
 
+	// Clamp scroll
+	maxScroll := len(allLines) - visibleLines
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	scroll := m.helpScroll
+	if scroll > maxScroll {
+		scroll = maxScroll
+	}
+
+	// Render visible window
+	end := scroll + visibleLines
+	if end > len(allLines) {
+		end = len(allLines)
+	}
 	linesWritten := 0
-	for _, g := range shortcuts {
-		if linesWritten >= visibleLines-2 {
-			break
+	for _, line := range allLines[scroll:end] {
+		if strings.HasPrefix(line, "\x00group:") {
+			b.WriteString(tuiSelectedStyle.Render(strings.TrimPrefix(line, "\x00group:")))
+		} else {
+			b.WriteString(line)
 		}
-		// Group header
-		b.WriteString(tuiSelectedStyle.Render(g.group))
 		b.WriteString("\x1b[K\n")
 		linesWritten++
-
-		for _, k := range g.keys {
-			if linesWritten >= visibleLines {
-				break
-			}
-			line := fmt.Sprintf("  %-12s %s", k.key, k.desc)
-			b.WriteString(line)
-			b.WriteString("\x1b[K\n")
-			linesWritten++
-		}
-		// Blank line between groups
-		if linesWritten < visibleLines {
-			b.WriteString("\x1b[K\n")
-			linesWritten++
-		}
 	}
 
 	// Pad remaining space
@@ -4306,7 +4652,8 @@ func (m tuiModel) renderHelpView() string {
 		linesWritten++
 	}
 
-	b.WriteString(tuiHelpStyle.Render("esc/q/?: close"))
+	helpHint := "↑/↓: scroll | esc/q/?: close"
+	b.WriteString(tuiHelpStyle.Render(helpHint))
 	b.WriteString("\x1b[K")
 	b.WriteString("\x1b[J") // Clear to end of screen
 

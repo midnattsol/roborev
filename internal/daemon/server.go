@@ -738,9 +738,24 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 		jobs = jobs[:limit] // Trim to requested limit
 	}
 
+	// Compute aggregate stats using same repo/branch filters (ignoring addressed filter and pagination)
+	var statsOpts []storage.ListJobsOption
+	if branch := r.URL.Query().Get("branch"); branch != "" {
+		if r.URL.Query().Get("branch_include_empty") == "true" {
+			statsOpts = append(statsOpts, storage.WithBranchOrEmpty(branch))
+		} else {
+			statsOpts = append(statsOpts, storage.WithBranch(branch))
+		}
+	}
+	stats, statsErr := s.db.CountJobStats(repo, statsOpts...)
+	if statsErr != nil {
+		log.Printf("Warning: failed to count job stats: %v", statsErr)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"jobs":     jobs,
 		"has_more": hasMore,
+		"stats":    stats,
 	})
 }
 
