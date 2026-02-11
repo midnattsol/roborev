@@ -1,28 +1,28 @@
 ---
-name: roborev:design-review
-description: Request a design review for a commit and present the results
+name: roborev:design-review-branch
+description: Request a design review for all commits on the current branch and present the results
 ---
 
-# roborev:design-review
+# roborev:design-review-branch
 
-Request a design review for a commit and present the results.
+Request a design review for all commits on the current branch and present the results.
 
 ## Usage
 
 ```
-$roborev:design-review [commit]
+$roborev:design-review-branch [--base <branch>]
 ```
 
 ## Instructions
 
-When the user invokes `$roborev:design-review [commit]`:
+When the user invokes `$roborev:design-review-branch [--base <branch>]`:
 
 ### 1. Validate inputs
 
-If a commit ref is provided, verify it resolves to a valid commit:
+If a base branch is provided, verify it resolves to a valid ref:
 
 ```bash
-git rev-parse --verify -- <commit>^{commit}
+git rev-parse --verify -- <branch>
 ```
 
 If validation fails, inform the user the ref is invalid. Do not proceed.
@@ -32,10 +32,10 @@ If validation fails, inform the user the ref is invalid. Do not proceed.
 Construct and execute the review command:
 
 ```bash
-roborev review [commit] --wait --type design
+roborev review --branch --wait --type design [--base <branch>]
 ```
 
-- If no commit is specified, omit it (defaults to HEAD)
+- If `--base` is specified, include it (otherwise auto-detects the base branch)
 
 The `--wait` flag blocks until the review completes.
 
@@ -53,16 +53,16 @@ Extract the job ID from the `Enqueued job <id> for ...` line in the command outp
 
 ## Example
 
-User: `$roborev:design-review`
+User: `$roborev:design-review-branch`
 
 Agent:
-1. Executes `roborev review --wait --type design`
+1. Executes `roborev review --branch --wait --type design`
 2. Presents the review output
 3. If findings exist: "Would you like me to address these findings? Run `$roborev:address 1042`"
 
-User: `$roborev:design-review abc123`
+User: `$roborev:design-review-branch --base develop`
 
 Agent:
-1. Validates: `git rev-parse --verify -- abc123^{commit}`
-2. Executes `roborev review abc123 --wait --type design`
+1. Validates: `git rev-parse --verify -- develop`
+2. Executes `roborev review --branch --wait --type design --base develop`
 3. Presents the review output

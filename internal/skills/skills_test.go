@@ -79,8 +79,8 @@ func TestInstallClaudeWhenDirExists(t *testing.T) {
 	if claudeResult.Skipped {
 		t.Error("expected Claude NOT to be skipped when ~/.claude exists")
 	}
-	if len(claudeResult.Installed) != 4 {
-		t.Errorf("expected 4 installed skills, got %v", claudeResult.Installed)
+	if len(claudeResult.Installed) != 7 {
+		t.Errorf("expected 7 installed skills, got %v", claudeResult.Installed)
 	}
 
 	// Verify Claude skill structure (flat directories with SKILL.md)
@@ -91,11 +91,20 @@ func TestInstallClaudeWhenDirExists(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(skillsDir, "roborev-design-review", "SKILL.md")); err != nil {
 		t.Error("expected roborev-design-review/SKILL.md to exist")
 	}
+	if _, err := os.Stat(filepath.Join(skillsDir, "roborev-design-review-branch", "SKILL.md")); err != nil {
+		t.Error("expected roborev-design-review-branch/SKILL.md to exist")
+	}
 	if _, err := os.Stat(filepath.Join(skillsDir, "roborev-fix", "SKILL.md")); err != nil {
 		t.Error("expected roborev-fix/SKILL.md to exist")
 	}
 	if _, err := os.Stat(filepath.Join(skillsDir, "roborev-respond", "SKILL.md")); err != nil {
 		t.Error("expected roborev-respond/SKILL.md to exist")
+	}
+	if _, err := os.Stat(filepath.Join(skillsDir, "roborev-review", "SKILL.md")); err != nil {
+		t.Error("expected roborev-review/SKILL.md to exist")
+	}
+	if _, err := os.Stat(filepath.Join(skillsDir, "roborev-review-branch", "SKILL.md")); err != nil {
+		t.Error("expected roborev-review-branch/SKILL.md to exist")
 	}
 }
 
@@ -117,8 +126,8 @@ func TestInstallCodexWhenDirExists(t *testing.T) {
 	if codexResult.Skipped {
 		t.Error("expected Codex NOT to be skipped when ~/.codex exists")
 	}
-	if len(codexResult.Installed) != 4 {
-		t.Errorf("expected 4 installed skills, got %v", codexResult.Installed)
+	if len(codexResult.Installed) != 7 {
+		t.Errorf("expected 7 installed skills, got %v", codexResult.Installed)
 	}
 
 	// Verify Codex skill structure (flat directories with SKILL.md)
@@ -129,11 +138,20 @@ func TestInstallCodexWhenDirExists(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(skillsDir, "roborev-design-review", "SKILL.md")); err != nil {
 		t.Error("expected roborev-design-review/SKILL.md to exist")
 	}
+	if _, err := os.Stat(filepath.Join(skillsDir, "roborev-design-review-branch", "SKILL.md")); err != nil {
+		t.Error("expected roborev-design-review-branch/SKILL.md to exist")
+	}
 	if _, err := os.Stat(filepath.Join(skillsDir, "roborev-fix", "SKILL.md")); err != nil {
 		t.Error("expected roborev-fix/SKILL.md to exist")
 	}
 	if _, err := os.Stat(filepath.Join(skillsDir, "roborev-respond", "SKILL.md")); err != nil {
 		t.Error("expected roborev-respond/SKILL.md to exist")
+	}
+	if _, err := os.Stat(filepath.Join(skillsDir, "roborev-review", "SKILL.md")); err != nil {
+		t.Error("expected roborev-review/SKILL.md to exist")
+	}
+	if _, err := os.Stat(filepath.Join(skillsDir, "roborev-review-branch", "SKILL.md")); err != nil {
+		t.Error("expected roborev-review-branch/SKILL.md to exist")
 	}
 }
 
@@ -152,8 +170,8 @@ func TestInstallIdempotent(t *testing.T) {
 	}
 
 	claude1 := getResultForAgent(t, results1, AgentClaude)
-	if len(claude1.Installed) != 4 {
-		t.Errorf("first install: expected 4 installed, got %d", len(claude1.Installed))
+	if len(claude1.Installed) != 7 {
+		t.Errorf("first install: expected 7 installed, got %d", len(claude1.Installed))
 	}
 	if len(claude1.Updated) != 0 {
 		t.Errorf("first install: expected 0 updated, got %d", len(claude1.Updated))
@@ -169,8 +187,8 @@ func TestInstallIdempotent(t *testing.T) {
 	if len(claude2.Installed) != 0 {
 		t.Errorf("second install: expected 0 installed, got %d", len(claude2.Installed))
 	}
-	if len(claude2.Updated) != 4 {
-		t.Errorf("second install: expected 4 updated, got %d", len(claude2.Updated))
+	if len(claude2.Updated) != 7 {
+		t.Errorf("second install: expected 7 updated, got %d", len(claude2.Updated))
 	}
 }
 
@@ -197,10 +215,48 @@ func TestIsInstalledClaude(t *testing.T) {
 	}
 
 	// Remove respond, add address
-	os.RemoveAll(filepath.Join(tmpHome, ".claude", "skills", "roborev-respond"))
+	if err := os.RemoveAll(filepath.Join(tmpHome, ".claude", "skills", "roborev-respond")); err != nil {
+		t.Fatalf("remove roborev-respond: %v", err)
+	}
 	createMockSkill(t, tmpHome, "claude", "roborev-address")
 	if !IsInstalled(AgentClaude) {
 		t.Error("expected IsInstalled=true when roborev-address/SKILL.md exists")
+	}
+
+	// Remove address, add review
+	if err := os.RemoveAll(filepath.Join(tmpHome, ".claude", "skills", "roborev-address")); err != nil {
+		t.Fatalf("remove roborev-address: %v", err)
+	}
+	createMockSkill(t, tmpHome, "claude", "roborev-review")
+	if !IsInstalled(AgentClaude) {
+		t.Error("expected IsInstalled=true when roborev-review/SKILL.md exists")
+	}
+
+	// Remove review, add review-branch
+	if err := os.RemoveAll(filepath.Join(tmpHome, ".claude", "skills", "roborev-review")); err != nil {
+		t.Fatalf("remove roborev-review: %v", err)
+	}
+	createMockSkill(t, tmpHome, "claude", "roborev-review-branch")
+	if !IsInstalled(AgentClaude) {
+		t.Error("expected IsInstalled=true when roborev-review-branch/SKILL.md exists")
+	}
+
+	// Remove review-branch, add design-review
+	if err := os.RemoveAll(filepath.Join(tmpHome, ".claude", "skills", "roborev-review-branch")); err != nil {
+		t.Fatalf("remove roborev-review-branch: %v", err)
+	}
+	createMockSkill(t, tmpHome, "claude", "roborev-design-review")
+	if !IsInstalled(AgentClaude) {
+		t.Error("expected IsInstalled=true when roborev-design-review/SKILL.md exists")
+	}
+
+	// Remove design-review, add design-review-branch
+	if err := os.RemoveAll(filepath.Join(tmpHome, ".claude", "skills", "roborev-design-review")); err != nil {
+		t.Fatalf("remove roborev-design-review: %v", err)
+	}
+	createMockSkill(t, tmpHome, "claude", "roborev-design-review-branch")
+	if !IsInstalled(AgentClaude) {
+		t.Error("expected IsInstalled=true when roborev-design-review-branch/SKILL.md exists")
 	}
 }
 
@@ -224,6 +280,42 @@ func TestIsInstalledCodex(t *testing.T) {
 	createMockSkill(t, tmpHome, "codex", "roborev-respond")
 	if !IsInstalled(AgentCodex) {
 		t.Error("expected IsInstalled=true when roborev-respond/SKILL.md exists")
+	}
+
+	// Remove respond, add review
+	if err := os.RemoveAll(filepath.Join(tmpHome, ".codex", "skills", "roborev-respond")); err != nil {
+		t.Fatalf("remove roborev-respond: %v", err)
+	}
+	createMockSkill(t, tmpHome, "codex", "roborev-review")
+	if !IsInstalled(AgentCodex) {
+		t.Error("expected IsInstalled=true when roborev-review/SKILL.md exists")
+	}
+
+	// Remove review, add review-branch
+	if err := os.RemoveAll(filepath.Join(tmpHome, ".codex", "skills", "roborev-review")); err != nil {
+		t.Fatalf("remove roborev-review: %v", err)
+	}
+	createMockSkill(t, tmpHome, "codex", "roborev-review-branch")
+	if !IsInstalled(AgentCodex) {
+		t.Error("expected IsInstalled=true when roborev-review-branch/SKILL.md exists")
+	}
+
+	// Remove review-branch, add design-review
+	if err := os.RemoveAll(filepath.Join(tmpHome, ".codex", "skills", "roborev-review-branch")); err != nil {
+		t.Fatalf("remove roborev-review-branch: %v", err)
+	}
+	createMockSkill(t, tmpHome, "codex", "roborev-design-review")
+	if !IsInstalled(AgentCodex) {
+		t.Error("expected IsInstalled=true when roborev-design-review/SKILL.md exists")
+	}
+
+	// Remove design-review, add design-review-branch
+	if err := os.RemoveAll(filepath.Join(tmpHome, ".codex", "skills", "roborev-design-review")); err != nil {
+		t.Fatalf("remove roborev-design-review: %v", err)
+	}
+	createMockSkill(t, tmpHome, "codex", "roborev-design-review-branch")
+	if !IsInstalled(AgentCodex) {
+		t.Error("expected IsInstalled=true when roborev-design-review-branch/SKILL.md exists")
 	}
 }
 
@@ -273,8 +365,8 @@ func TestUpdateOnlyUpdatesInstalled(t *testing.T) {
 			if len(results[0].Updated) != 1 {
 				t.Errorf("expected 1 updated (respond), got %d", len(results[0].Updated))
 			}
-			if len(results[0].Installed) != 3 {
-				t.Errorf("expected 3 installed (address, design-review, fix), got %d", len(results[0].Installed))
+			if len(results[0].Installed) != 6 {
+				t.Errorf("expected 6 installed (address, design-review, design-review-branch, fix, review, review-branch), got %d", len(results[0].Installed))
 			}
 		}
 	})
@@ -312,6 +404,15 @@ func TestUpdateOnlyUpdatesInstalled(t *testing.T) {
 		}
 		if len(results) > 0 && results[0].Agent != AgentCodex {
 			t.Errorf("expected Codex result, got %s", results[0].Agent)
+		}
+		// Should update respond (existed) and install the rest (didn't exist)
+		if len(results) > 0 {
+			if len(results[0].Updated) != 1 {
+				t.Errorf("expected 1 updated (respond), got %d", len(results[0].Updated))
+			}
+			if len(results[0].Installed) != 6 {
+				t.Errorf("expected 6 installed (address, design-review, design-review-branch, fix, review, review-branch), got %d", len(results[0].Installed))
+			}
 		}
 	})
 

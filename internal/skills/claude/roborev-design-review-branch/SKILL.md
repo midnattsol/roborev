@@ -1,28 +1,28 @@
 ---
-name: roborev:design-review
-description: Request a design review for a commit and present the results
+name: roborev:design-review-branch
+description: Request a design review for all commits on the current branch and present the results
 ---
 
-# roborev:design-review
+# roborev:design-review-branch
 
-Request a design review for a commit and present the results.
+Request a design review for all commits on the current branch and present the results.
 
 ## Usage
 
 ```
-/roborev:design-review [commit]
+/roborev:design-review-branch [--base <branch>]
 ```
 
 ## Instructions
 
-When the user invokes `/roborev:design-review [commit]`:
+When the user invokes `/roborev:design-review-branch [--base <branch>]`:
 
 ### 1. Validate inputs
 
-If a commit ref is provided, verify it resolves to a valid commit:
+If a base branch is provided, verify it resolves to a valid ref:
 
 ```bash
-git rev-parse --verify -- <commit>^{commit}
+git rev-parse --verify -- <branch>
 ```
 
 If validation fails, inform the user the ref is invalid. Do not proceed.
@@ -32,10 +32,10 @@ If validation fails, inform the user the ref is invalid. Do not proceed.
 Construct the review command:
 
 ```
-roborev review [commit] --wait --type design
+roborev review --branch --wait --type design [--base <branch>]
 ```
 
-- If no commit is specified, omit it (defaults to HEAD)
+- If `--base` is specified, include it (otherwise auto-detects the base branch)
 
 ### 3. Run the review in the background
 
@@ -44,7 +44,7 @@ Launch a background task that runs the command. This lets the user continue work
 Use the `Task` tool with `run_in_background: true` and `subagent_type: "Bash"`:
 
 ```
-roborev review [commit] --wait --type design
+roborev review --branch --wait --type design [--base <branch>]
 ```
 
 Tell the user that the design review has been submitted and they can continue working. You will present the results when the review completes.
@@ -63,17 +63,17 @@ Extract the job ID from the `Enqueued job <id> for ...` line in the command outp
 
 ## Example
 
-User: `/roborev:design-review`
+User: `/roborev:design-review-branch`
 
 Agent:
-1. Launches background task: `roborev review --wait --type design`
-2. Tells user: "Design review submitted for HEAD. I'll present the results when it completes."
+1. Launches background task: `roborev review --branch --wait --type design`
+2. Tells user: "Design review submitted for branch. I'll present the results when it completes."
 3. When complete, presents the review output
 4. If findings exist: "Would you like me to address these findings? Run `/roborev:address 1042`"
 
-User: `/roborev:design-review abc123`
+User: `/roborev:design-review-branch --base develop`
 
 Agent:
-1. Launches background task: `roborev review abc123 --wait --type design`
-2. Tells user: "Design review submitted for abc123. I'll present the results when it completes."
+1. Launches background task: `roborev review --branch --wait --type design --base develop`
+2. Tells user: "Design review submitted for branch (against develop). I'll present the results when it completes."
 3. When complete, presents the review output
