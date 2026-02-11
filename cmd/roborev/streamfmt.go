@@ -19,10 +19,20 @@ import (
 //
 // In non-TTY mode (piped output), raw JSON is passed through unchanged.
 type streamFormatter struct {
-	w        io.Writer
-	buf      []byte
-	isTTY    bool
+	w     io.Writer
+	buf   []byte
+	isTTY bool
+
 	writeErr error // first write error encountered during formatting
+
+	// Tracks codex command_execution items that have already been rendered.
+	codexRenderedCommandIDs map[string]struct{}
+	// Track started command text to suppress duplicate completed echoes, including mixed-ID pairs.
+	codexStartedCommands map[string]int
+	// Track started command text by ID so completed events missing command can clear started state.
+	codexStartedCommandsByID map[string]string
+	// Track started IDs per command in FIFO order for deterministic pairing.
+	codexStartedIDsByCommand map[string][]string
 }
 
 func newStreamFormatter(w io.Writer, isTTY bool) *streamFormatter {
@@ -62,12 +72,16 @@ func (f *streamFormatter) Flush() {
 }
 
 // streamEvent is a unified representation of stream-json events from
-// both Claude Code and Gemini CLI.
+// Claude Code, Gemini CLI, and Codex CLI.
 //
 // Claude:  {"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{...}}]}}
 // Gemini:  {"type":"tool_use","tool_name":"read_file","parameters":{"file_path":"..."}}
 //
 //	{"type":"message","role":"assistant","content":"...","delta":true}
+//
+// Codex:   {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+//
+//	{"type":"item.started","item":{"type":"command_execution","command":"bash -lc ls"}}
 type streamEvent struct {
 	Type string `json:"type"`
 	// Claude: nested message with content blocks
@@ -79,6 +93,16 @@ type streamEvent struct {
 	Content    json.RawMessage `json:"content,omitempty"`
 	ToolName   string          `json:"tool_name,omitempty"`
 	Parameters json.RawMessage `json:"parameters,omitempty"`
+	// Codex: item events
+	Item *codexItem `json:"item,omitempty"`
+}
+
+// codexItem represents the item field in codex JSONL events.
+type codexItem struct {
+	ID      string `json:"id,omitempty"`
+	Type    string `json:"type,omitempty"`
+	Text    string `json:"text,omitempty"`
+	Command string `json:"command,omitempty"`
 }
 
 type contentBlock struct {
@@ -133,11 +157,181 @@ func (f *streamFormatter) processLine(line string) {
 			}
 			f.formatToolUse(displayName, ev.Parameters)
 		}
-	case "result", "tool_result", "init":
-		// Suppress
+	case "item.started", "item.completed", "item.updated":
+		// Codex format: item events
+		f.processCodexItem(ev.Type, ev.Item)
+	case "result", "tool_result", "init",
+		"thread.started", "turn.started", "turn.completed":
+		// Suppress lifecycle events
 	default:
 		// Suppress system, user, and other events
 	}
+}
+
+func (f *streamFormatter) processCodexItem(eventType string, item *codexItem) {
+	if item == nil {
+		return
+	}
+	switch item.Type {
+	case "agent_message":
+		if eventType != "item.completed" {
+			return
+		}
+		if text := strings.TrimSpace(item.Text); text != "" {
+			f.writef("%s\n", text)
+		}
+	case "command_execution":
+		cmd := strings.TrimSpace(item.Command)
+		if !f.shouldRenderCodexCommand(eventType, item, cmd) {
+			return
+		}
+		if len(cmd) > 80 {
+			cmd = cmd[:77] + "..."
+		}
+		f.writef("%-6s %s\n", "Bash", cmd)
+	case "file_change":
+		if eventType != "item.completed" {
+			return
+		}
+		f.writef("%-6s\n", "Edit")
+	}
+}
+
+func (f *streamFormatter) shouldRenderCodexCommand(eventType string, item *codexItem, cmd string) bool {
+	if eventType != "item.started" && eventType != "item.completed" {
+		return false
+	}
+	id := strings.TrimSpace(item.ID)
+	if eventType == "item.started" {
+		if cmd == "" {
+			return false
+		}
+		if id != "" {
+			if f.codexRenderedCommandIDs == nil {
+				f.codexRenderedCommandIDs = make(map[string]struct{})
+			}
+			if _, seen := f.codexRenderedCommandIDs[id]; seen {
+				return false
+			}
+			f.codexRenderedCommandIDs[id] = struct{}{}
+			if f.codexStartedCommandsByID == nil {
+				f.codexStartedCommandsByID = make(map[string]string)
+			}
+			f.codexStartedCommandsByID[id] = cmd
+			if f.codexStartedIDsByCommand == nil {
+				f.codexStartedIDsByCommand = make(map[string][]string)
+			}
+			f.codexStartedIDsByCommand[cmd] = append(f.codexStartedIDsByCommand[cmd], id)
+		}
+		if f.codexStartedCommands == nil {
+			f.codexStartedCommands = make(map[string]int)
+		}
+		f.codexStartedCommands[cmd]++
+		return true
+	}
+
+	if cmd == "" {
+		if id != "" {
+			if startedCmd, ok := f.codexStartedCommandsByID[id]; ok {
+				f.decrementCodexStartedCommand(startedCmd)
+				f.removeCodexStartedIDFromQueue(startedCmd, id)
+				delete(f.codexStartedCommandsByID, id)
+			}
+		}
+		return false
+	}
+
+	if id != "" {
+		if startedCmd, ok := f.codexStartedCommandsByID[id]; ok {
+			f.decrementCodexStartedCommand(startedCmd)
+			f.removeCodexStartedIDFromQueue(startedCmd, id)
+			delete(f.codexStartedCommandsByID, id)
+			if startedCmd == cmd {
+				if f.codexRenderedCommandIDs == nil {
+					f.codexRenderedCommandIDs = make(map[string]struct{})
+				}
+				f.codexRenderedCommandIDs[id] = struct{}{}
+				return false
+			}
+		}
+	}
+
+	// Completed events should be suppressed when we've already rendered the paired
+	// started event for the same command text, even if ID presence changed.
+	if count := f.codexStartedCommands[cmd]; count > 0 {
+		f.decrementCodexStartedCommand(cmd)
+		if id == "" {
+			// Keep ID->command tracking in sync when a completion is matched by command only.
+			f.consumeCodexStartedCommandIDForCommand(cmd)
+		}
+		if id != "" {
+			if f.codexRenderedCommandIDs == nil {
+				f.codexRenderedCommandIDs = make(map[string]struct{})
+			}
+			f.codexRenderedCommandIDs[id] = struct{}{}
+		}
+		return false
+	}
+
+	if id != "" {
+		if f.codexRenderedCommandIDs == nil {
+			f.codexRenderedCommandIDs = make(map[string]struct{})
+		}
+		if _, seen := f.codexRenderedCommandIDs[id]; seen {
+			return false
+		}
+		f.codexRenderedCommandIDs[id] = struct{}{}
+		return true
+	}
+
+	return true
+}
+
+func (f *streamFormatter) consumeCodexStartedCommandIDForCommand(cmd string) {
+	if cmd == "" {
+		return
+	}
+	ids := f.codexStartedIDsByCommand[cmd]
+	if len(ids) == 0 {
+		return
+	}
+	// Pop the oldest ID (FIFO) for deterministic pairing.
+	consumed := ids[0]
+	if len(ids) == 1 {
+		delete(f.codexStartedIDsByCommand, cmd)
+	} else {
+		f.codexStartedIDsByCommand[cmd] = ids[1:]
+	}
+	delete(f.codexStartedCommandsByID, consumed)
+}
+
+// removeCodexStartedIDFromQueue removes a specific ID from the per-command FIFO.
+func (f *streamFormatter) removeCodexStartedIDFromQueue(cmd, id string) {
+	ids := f.codexStartedIDsByCommand[cmd]
+	for i, v := range ids {
+		if v == id {
+			f.codexStartedIDsByCommand[cmd] = append(ids[:i], ids[i+1:]...)
+			if len(f.codexStartedIDsByCommand[cmd]) == 0 {
+				delete(f.codexStartedIDsByCommand, cmd)
+			}
+			return
+		}
+	}
+}
+
+func (f *streamFormatter) decrementCodexStartedCommand(cmd string) {
+	if cmd == "" {
+		return
+	}
+	count := f.codexStartedCommands[cmd]
+	if count <= 0 {
+		return
+	}
+	if count == 1 {
+		delete(f.codexStartedCommands, cmd)
+		return
+	}
+	f.codexStartedCommands[cmd] = count - 1
 }
 
 func (f *streamFormatter) processAssistantContent(raw json.RawMessage) {

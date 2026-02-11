@@ -50,6 +50,14 @@ func (fix *streamFormatterFixture) assertEmpty(t *testing.T) {
 	}
 }
 
+func (fix *streamFormatterFixture) assertCount(t *testing.T, substr string, want int) {
+	t.Helper()
+	got := strings.Count(fix.output(), substr)
+	if got != want {
+		t.Errorf("expected output to contain %q %d time(s), got %d:\n%s", substr, want, got, fix.output())
+	}
+}
+
 // mustMarshal is like json.Marshal but panics on error.
 // Safe to use in tests where inputs are always simple map literals.
 func mustMarshal(v interface{}) []byte {
@@ -217,6 +225,182 @@ func TestStreamFormatter_GeminiToolResult_Suppressed(t *testing.T) {
 	fix := newFixture(true)
 	fix.writeLine(`{"type":"tool_result","tool_id":"t1","status":"success","output":"file contents here"}`)
 	fix.assertEmpty(t)
+}
+
+func TestStreamFormatter_CodexEvents(t *testing.T) {
+	fix := newFixture(true)
+
+	lines := []string{
+		`{"type":"thread.started","thread_id":"abc123"}`,
+		`{"type":"turn.started"}`,
+		`{"type":"item.started","item":{"type":"command_execution","command":"bash -lc ls"}}`,
+		`{"type":"item.updated","item":{"type":"command_execution","command":"bash -lc ls"}}`,
+		`{"type":"item.completed","item":{"type":"command_execution","command":"bash -lc ls","exit_code":0}}`,
+		`{"type":"item.updated","item":{"type":"file_change","changes":[{"path":"main.go","kind":"update"}]}}`,
+		`{"type":"item.completed","item":{"type":"file_change","changes":[{"path":"main.go","kind":"update"}]}}`,
+		`{"type":"item.updated","item":{"type":"agent_message","text":"draft"}}`,
+		`{"type":"item.completed","item":{"type":"agent_message","text":"I fixed the issue."}}`,
+		`{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":50}}`,
+	}
+
+	for _, line := range lines {
+		fix.writeLine(line)
+	}
+
+	fix.assertContains(t, "Bash   bash -lc ls")
+	fix.assertContains(t, "Edit")
+	fix.assertContains(t, "I fixed the issue.")
+	fix.assertCount(t, "Bash   bash -lc ls", 1)
+	fix.assertCount(t, "Edit", 1)
+	// Lifecycle events should be suppressed
+	fix.assertNotContains(t, "thread_id")
+	fix.assertNotContains(t, "turn.started")
+	fix.assertNotContains(t, "input_tokens")
+	fix.assertNotContains(t, "draft")
+}
+
+func TestStreamFormatter_CodexUpdatedSuppressed(t *testing.T) {
+	fix := newFixture(true)
+
+	lines := []string{
+		`{"type":"item.updated","item":{"type":"command_execution","command":"bash -lc ls"}}`,
+		`{"type":"item.updated","item":{"type":"file_change","changes":[{"path":"main.go","kind":"update"}]}}`,
+		`{"type":"item.updated","item":{"type":"agent_message","text":"still drafting"}}`,
+	}
+
+	for _, line := range lines {
+		fix.writeLine(line)
+	}
+
+	fix.assertEmpty(t)
+}
+
+func TestStreamFormatter_CodexLifecycleSuppressed(t *testing.T) {
+	fix := newFixture(true)
+	fix.writeLine(`{"type":"thread.started","thread_id":"abc"}`)
+	fix.writeLine(`{"type":"turn.started"}`)
+	fix.writeLine(`{"type":"turn.completed","usage":{"input_tokens":100}}`)
+	fix.assertEmpty(t)
+}
+
+func TestStreamFormatter_CodexCommandTruncation(t *testing.T) {
+	fix := newFixture(true)
+	longCmd := "bash -lc " + strings.Repeat("x", 100)
+	fix.writeLine(fmt.Sprintf(`{"type":"item.started","item":{"type":"command_execution","command":%q}}`, longCmd))
+	got := fix.output()
+	if !strings.Contains(got, "...") {
+		t.Errorf("long codex command should be truncated with ..., got:\n%s", got)
+	}
+}
+
+func TestStreamFormatter_CodexCommandCompletedFallback(t *testing.T) {
+	fix := newFixture(true)
+
+	lines := []string{
+		`{"type":"item.started","item":{"id":"cmd_1","type":"command_execution"}}`,
+		`{"type":"item.completed","item":{"id":"cmd_1","type":"command_execution","command":"bash -lc ls"}}`,
+		`{"type":"item.completed","item":{"id":"cmd_2","type":"command_execution","command":"bash -lc pwd"}}`,
+	}
+
+	for _, line := range lines {
+		fix.writeLine(line)
+	}
+
+	fix.assertContains(t, "Bash   bash -lc ls")
+	fix.assertContains(t, "Bash   bash -lc pwd")
+	fix.assertCount(t, "Bash   bash -lc ls", 1)
+	fix.assertCount(t, "Bash   bash -lc pwd", 1)
+}
+
+func TestStreamFormatter_CodexCommandMixedIDStartedWithoutIDCompletedWithID(t *testing.T) {
+	fix := newFixture(true)
+
+	lines := []string{
+		`{"type":"item.started","item":{"type":"command_execution","command":"bash -lc ls"}}`,
+		`{"type":"item.completed","item":{"id":"cmd_1","type":"command_execution","command":"bash -lc ls"}}`,
+	}
+
+	for _, line := range lines {
+		fix.writeLine(line)
+	}
+
+	fix.assertContains(t, "Bash   bash -lc ls")
+	fix.assertCount(t, "Bash   bash -lc ls", 1)
+}
+
+func TestStreamFormatter_CodexCommandMixedIDStartedWithIDCompletedWithoutID(t *testing.T) {
+	fix := newFixture(true)
+
+	lines := []string{
+		`{"type":"item.started","item":{"id":"cmd_1","type":"command_execution","command":"bash -lc ls"}}`,
+		`{"type":"item.completed","item":{"type":"command_execution","command":"bash -lc ls"}}`,
+	}
+
+	for _, line := range lines {
+		fix.writeLine(line)
+	}
+
+	fix.assertContains(t, "Bash   bash -lc ls")
+	fix.assertCount(t, "Bash   bash -lc ls", 1)
+}
+
+func TestStreamFormatter_CodexCommandStartedWithIDCompletedWithoutCommandClearsCounter(t *testing.T) {
+	fix := newFixture(true)
+
+	lines := []string{
+		`{"type":"item.started","item":{"id":"cmd_1","type":"command_execution","command":"bash -lc ls"}}`,
+		`{"type":"item.completed","item":{"id":"cmd_1","type":"command_execution"}}`,
+		`{"type":"item.completed","item":{"id":"cmd_2","type":"command_execution","command":"bash -lc ls"}}`,
+	}
+
+	for _, line := range lines {
+		fix.writeLine(line)
+	}
+
+	fix.assertContains(t, "Bash   bash -lc ls")
+	fix.assertCount(t, "Bash   bash -lc ls", 2)
+}
+
+func TestStreamFormatter_CodexCommandMixedIDFallbackDoesNotLeaveStaleID(t *testing.T) {
+	fix := newFixture(true)
+
+	lines := []string{
+		`{"type":"item.started","item":{"id":"cmd_1","type":"command_execution","command":"bash -lc ls"}}`,
+		`{"type":"item.completed","item":{"type":"command_execution","command":"bash -lc ls"}}`,
+		`{"type":"item.started","item":{"id":"cmd_2","type":"command_execution","command":"bash -lc ls"}}`,
+		`{"type":"item.completed","item":{"id":"cmd_1","type":"command_execution"}}`,
+		`{"type":"item.completed","item":{"type":"command_execution","command":"bash -lc ls"}}`,
+	}
+
+	for _, line := range lines {
+		fix.writeLine(line)
+	}
+
+	fix.assertContains(t, "Bash   bash -lc ls")
+	fix.assertCount(t, "Bash   bash -lc ls", 2)
+}
+
+func TestStreamFormatter_CodexMultiIDSameCommandDeterministicPairing(t *testing.T) {
+	fix := newFixture(true)
+
+	// Two started events with same command text but different IDs.
+	// A command-only completion should consume the first (FIFO), leaving
+	// the second ID valid for its own ID-only completion.
+	lines := []string{
+		`{"type":"item.started","item":{"id":"cmd_A","type":"command_execution","command":"bash -lc ls"}}`,
+		`{"type":"item.started","item":{"id":"cmd_B","type":"command_execution","command":"bash -lc ls"}}`,
+		// Command-only completion should consume cmd_A (FIFO), not cmd_B.
+		`{"type":"item.completed","item":{"type":"command_execution","command":"bash -lc ls"}}`,
+		// ID-only completion for cmd_B should clear state without rendering.
+		`{"type":"item.completed","item":{"id":"cmd_B","type":"command_execution"}}`,
+	}
+
+	for _, line := range lines {
+		fix.writeLine(line)
+	}
+
+	// Two started renders, both completions suppressed = exactly 2 lines.
+	fix.assertCount(t, "Bash   bash -lc ls", 2)
 }
 
 func TestStreamFormatter_PartialWrites(t *testing.T) {
