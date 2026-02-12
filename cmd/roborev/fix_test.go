@@ -1323,3 +1323,100 @@ func TestFixListFlagValidation(t *testing.T) {
 		})
 	}
 }
+
+// setupWorktree creates a main repo with a commit and a worktree, returning
+// the main repo and the worktree directory path.
+func setupWorktree(t *testing.T) (mainRepo *TestGitRepo, worktreeDir string) {
+	t.Helper()
+	repo := newTestGitRepo(t)
+	repo.CommitFile("file.txt", "content", "initial")
+
+	wtDir := t.TempDir()
+	os.Remove(wtDir)
+	repo.Run("worktree", "add", "-b", "wt-branch", wtDir)
+	return repo, wtDir
+}
+
+// setupWorktreeMockDaemon sets up a mock daemon that captures the repo query
+// param from /api/jobs requests, returning empty results.
+func setupWorktreeMockDaemon(t *testing.T) (receivedRepo *string) {
+	t.Helper()
+	var repo string
+	_, cleanup := setupMockDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/jobs" {
+			repo = r.URL.Query().Get("repo")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"jobs":     []storage.ReviewJob{},
+				"has_more": false,
+			})
+			return
+		}
+	}))
+	t.Cleanup(cleanup)
+	return &repo
+}
+
+func TestFixWorktreeRepoResolution(t *testing.T) {
+	t.Run("runFixList sends main repo path", func(t *testing.T) {
+		receivedRepo := setupWorktreeMockDaemon(t)
+		repo, worktreeDir := setupWorktree(t)
+		chdir(t, worktreeDir)
+
+		cmd := &cobra.Command{}
+		var buf bytes.Buffer
+		cmd.SetOut(&buf)
+		if err := runFixList(cmd, "", false); err != nil {
+			t.Fatalf("runFixList: %v", err)
+		}
+
+		if *receivedRepo == "" {
+			t.Fatal("expected repo param to be sent")
+		}
+		if *receivedRepo != repo.Dir {
+			t.Errorf("expected main repo path %q, got %q", repo.Dir, *receivedRepo)
+		}
+	})
+
+	t.Run("runFixUnaddressed sends main repo path", func(t *testing.T) {
+		receivedRepo := setupWorktreeMockDaemon(t)
+		repo, worktreeDir := setupWorktree(t)
+		chdir(t, worktreeDir)
+
+		cmd := &cobra.Command{}
+		var buf bytes.Buffer
+		cmd.SetOut(&buf)
+		opts := fixOptions{quiet: true}
+		if err := runFixUnaddressed(cmd, "", false, opts); err != nil {
+			t.Fatalf("runFixUnaddressed: %v", err)
+		}
+
+		if *receivedRepo == "" {
+			t.Fatal("expected repo param to be sent")
+		}
+		if *receivedRepo != repo.Dir {
+			t.Errorf("expected main repo path %q, got %q", repo.Dir, *receivedRepo)
+		}
+	})
+
+	t.Run("runFixBatch sends main repo path", func(t *testing.T) {
+		receivedRepo := setupWorktreeMockDaemon(t)
+		repo, worktreeDir := setupWorktree(t)
+		chdir(t, worktreeDir)
+
+		cmd := &cobra.Command{}
+		var buf bytes.Buffer
+		cmd.SetOut(&buf)
+		opts := fixOptions{quiet: true}
+		// nil jobIDs triggers discovery via queryUnaddressedJobs
+		if err := runFixBatch(cmd, nil, "", false, opts); err != nil {
+			t.Fatalf("runFixBatch: %v", err)
+		}
+
+		if *receivedRepo == "" {
+			t.Fatal("expected repo param to be sent")
+		}
+		if *receivedRepo != repo.Dir {
+			t.Errorf("expected main repo path %q, got %q", repo.Dir, *receivedRepo)
+		}
+	})
+}
