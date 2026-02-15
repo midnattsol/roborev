@@ -19,8 +19,6 @@ func (m tuiModel) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleCommentKey(msg)
 	case tuiViewFilter:
 		return m.handleFilterKey(msg)
-	case tuiViewBranchFilter:
-		return m.handleBranchFilterKey(msg)
 	case tuiViewTail:
 		return m.handleTailKey(msg)
 	}
@@ -67,7 +65,7 @@ func (m tuiModel) handleCommentKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
-// handleFilterKey handles key input in the repo filter modal.
+// handleFilterKey handles key input in the unified tree filter modal.
 func (m tuiModel) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
@@ -75,6 +73,7 @@ func (m tuiModel) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc", "q":
 		m.currentView = tuiViewQueue
 		m.filterSearch = ""
+		m.filterBranchMode = false
 		return m, nil
 	case "up", "k":
 		m.filterNavigateUp()
@@ -82,32 +81,106 @@ func (m tuiModel) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		m.filterNavigateDown()
 		return m, nil
-	case "enter":
-		selected := m.getSelectedFilterRepo()
-		if selected != nil {
-			if len(selected.rootPaths) == 0 {
-				m.activeRepoFilter = nil
-				m.removeFilterFromStack(filterTypeRepo)
-			} else {
-				m.activeRepoFilter = selected.rootPaths
-				m.pushFilter(filterTypeRepo)
+	case "right":
+		// Expand a collapsed repo node, or retry a failed load
+		entry := m.getSelectedFilterEntry()
+		if entry != nil && entry.repoIdx >= 0 && entry.branchIdx == -1 {
+			node := &m.filterTree[entry.repoIdx]
+			needsFetch := node.children == nil && !node.loading
+			if !node.expanded || needsFetch {
+				node.userCollapsed = false
+				if len(node.children) > 0 {
+					node.expanded = true
+					m.rebuildFilterFlatList()
+				} else if !node.loading {
+					node.expanded = true
+					node.loading = true
+					node.fetchFailed = false
+					return m, m.fetchBranchesForRepo(
+						node.rootPaths, entry.repoIdx, true, m.filterSearchSeq,
+					)
+				} else {
+					// Load in-flight (search-triggered); mark
+					// expanded so children show on arrival.
+					node.expanded = true
+				}
 			}
-			m.currentView = tuiViewQueue
-			m.filterSearch = ""
-			m.selectedIdx = -1
-			m.selectedJobID = 0
-			m.fetchSeq++
-			m.loadingJobs = true
-			return m, m.fetchJobs()
 		}
 		return m, nil
+	case "left":
+		// Collapse an expanded repo, or if on a branch, collapse parent
+		entry := m.getSelectedFilterEntry()
+		if entry != nil {
+			collapse := func(idx int) {
+				m.filterTree[idx].expanded = false
+				if m.filterSearch != "" {
+					m.filterTree[idx].userCollapsed = true
+				}
+				m.rebuildFilterFlatList()
+			}
+			if entry.branchIdx >= 0 {
+				// On a branch: collapse parent and move selection to parent
+				collapse(entry.repoIdx)
+				for i, e := range m.filterFlatList {
+					if e.repoIdx == entry.repoIdx && e.branchIdx == -1 {
+						m.filterSelectedIdx = i
+						break
+					}
+				}
+			} else if entry.repoIdx >= 0 {
+				node := &m.filterTree[entry.repoIdx]
+				if node.expanded ||
+					(m.filterSearch != "" && !node.userCollapsed) {
+					collapse(entry.repoIdx)
+				}
+			}
+		}
+		return m, nil
+	case "enter":
+		entry := m.getSelectedFilterEntry()
+		if entry == nil {
+			return m, nil
+		}
+		if entry.repoIdx == -1 {
+			// "All" -- clear all filters
+			m.activeRepoFilter = nil
+			m.activeBranchFilter = ""
+			m.filterStack = nil
+		} else if entry.branchIdx == -1 {
+			// Repo node -- filter by repo only
+			node := m.filterTree[entry.repoIdx]
+			m.activeRepoFilter = node.rootPaths
+			m.activeBranchFilter = ""
+			m.removeFilterFromStack(filterTypeBranch)
+			m.pushFilter(filterTypeRepo)
+		} else {
+			// Branch node -- filter by repo + branch
+			node := m.filterTree[entry.repoIdx]
+			branch := node.children[entry.branchIdx]
+			m.activeRepoFilter = node.rootPaths
+			m.activeBranchFilter = branch.name
+			m.pushFilter(filterTypeRepo)
+			m.pushFilter(filterTypeBranch)
+		}
+		m.currentView = tuiViewQueue
+		m.filterSearch = ""
+		m.filterBranchMode = false
+		m.hasMore = false
+		m.selectedIdx = -1
+		m.selectedJobID = 0
+		m.fetchSeq++
+		m.loadingJobs = true
+		return m, m.fetchJobs()
 	case "backspace":
 		if len(m.filterSearch) > 0 {
 			runes := []rune(m.filterSearch)
 			m.filterSearch = string(runes[:len(runes)-1])
+			m.filterSearchSeq++
+			m.clearFetchFailed()
 			m.filterSelectedIdx = 0
+			m.rebuildFilterFlatList()
 		}
-		return m, nil
+		return m, m.fetchUnloadedBranches()
 	default:
 		if len(msg.Runes) > 0 {
 			for _, r := range msg.Runes {
@@ -116,64 +189,64 @@ func (m tuiModel) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.filterSelectedIdx = 0
 				}
 			}
+			m.filterSearchSeq++
+			m.clearFetchFailed()
+			m.rebuildFilterFlatList()
 		}
-		return m, nil
+		return m, m.fetchUnloadedBranches()
 	}
 }
 
-// handleBranchFilterKey handles key input in the branch filter modal.
-func (m tuiModel) handleBranchFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "ctrl+c":
-		return m, tea.Quit
-	case "esc", "q":
-		m.currentView = tuiViewQueue
-		m.branchFilterSearch = ""
-		return m, nil
-	case "up", "k":
-		m.branchFilterNavigateUp()
-		return m, nil
-	case "down", "j":
-		m.branchFilterNavigateDown()
-		return m, nil
-	case "enter":
-		selected := m.getSelectedFilterBranch()
-		if selected != nil {
-			if selected.name == "" {
-				m.activeBranchFilter = ""
-				m.removeFilterFromStack(filterTypeBranch)
-			} else {
-				m.activeBranchFilter = selected.name
-				m.pushFilter(filterTypeBranch)
-			}
-			m.currentView = tuiViewQueue
-			m.branchFilterSearch = ""
-			m.hasMore = false
-			m.selectedIdx = -1
-			m.selectedJobID = 0
-			m.fetchSeq++
-			m.loadingJobs = true
-			return m, m.fetchJobs()
-		}
-		return m, nil
-	case "backspace":
-		if len(m.branchFilterSearch) > 0 {
-			runes := []rune(m.branchFilterSearch)
-			m.branchFilterSearch = string(runes[:len(runes)-1])
-			m.branchFilterSelectedIdx = 0
-		}
-		return m, nil
-	default:
-		if len(msg.Runes) > 0 {
-			for _, r := range msg.Runes {
-				if unicode.IsPrint(r) && !unicode.IsControl(r) {
-					m.branchFilterSearch += string(r)
-					m.branchFilterSelectedIdx = 0
-				}
-			}
-		}
-		return m, nil
+// clearFetchFailed resets fetchFailed on all tree nodes so that
+// changed search text retries previously failed repos.
+func (m *tuiModel) clearFetchFailed() {
+	for i := range m.filterTree {
+		m.filterTree[i].fetchFailed = false
 	}
+}
+
+// maxSearchBranchFetches is the maximum number of concurrent
+// search-triggered branch fetches. Counts both already in-flight
+// and newly started requests.
+const maxSearchBranchFetches = 5
+
+// fetchUnloadedBranches triggers branch fetches for repos that
+// haven't loaded branches yet while search text is active. Without
+// this, searching for a branch name only matches already-expanded
+// repos. At most maxSearchBranchFetches total requests are allowed
+// in-flight at once; completions trigger top-up fetches via the
+// tuiRepoBranchesMsg handler.
+func (m *tuiModel) fetchUnloadedBranches() tea.Cmd {
+	if m.filterSearch == "" {
+		return nil
+	}
+	inFlight := 0
+	for i := range m.filterTree {
+		if m.filterTree[i].loading {
+			inFlight++
+		}
+	}
+	slots := maxSearchBranchFetches - inFlight
+	if slots <= 0 {
+		return nil
+	}
+	var cmds []tea.Cmd
+	for i := range m.filterTree {
+		node := &m.filterTree[i]
+		if node.children == nil && !node.loading && !node.fetchFailed {
+			node.loading = true
+			cmds = append(cmds, m.fetchBranchesForRepo(
+				node.rootPaths, i, false, m.filterSearchSeq,
+			))
+			if len(cmds) >= slots {
+				break
+			}
+		}
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
 }
 
 // handleTailKey handles key input in the tail view.
@@ -804,10 +877,14 @@ func (m tuiModel) handleFilterOpenKey() (tea.Model, tea.Cmd) {
 	if m.currentView != tuiViewQueue {
 		return m, nil
 	}
-	m.filterRepos = nil
+	m.filterTree = nil
+	m.filterFlatList = nil
 	m.filterSelectedIdx = 0
 	m.filterSearch = ""
 	m.currentView = tuiViewFilter
+	if !m.branchBackfillDone {
+		return m, tea.Batch(m.fetchRepos(), m.backfillBranches())
+	}
 	return m, m.fetchRepos()
 }
 
@@ -815,11 +892,8 @@ func (m tuiModel) handleBranchFilterOpenKey() (tea.Model, tea.Cmd) {
 	if m.currentView != tuiViewQueue {
 		return m, nil
 	}
-	m.filterBranches = nil
-	m.branchFilterSelectedIdx = 0
-	m.branchFilterSearch = ""
-	m.currentView = tuiViewBranchFilter
-	return m, m.fetchBranches()
+	m.filterBranchMode = true
+	return m.handleFilterOpenKey()
 }
 
 func (m tuiModel) handleHideAddressedKey() (tea.Model, tea.Cmd) {
@@ -1225,8 +1299,13 @@ func (m tuiModel) handleReconnectMsg(msg tuiReconnectMsg) (tea.Model, tea.Cmd) {
 		if msg.version != "" {
 			m.daemonVersion = msg.version
 		}
+		m.clearFetchFailed()
 		m.loadingJobs = true
-		return m, tea.Batch(m.fetchJobs(), m.fetchStatus())
+		cmds := []tea.Cmd{m.fetchJobs(), m.fetchStatus()}
+		if cmd := m.fetchUnloadedBranches(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
 	}
 	return m, nil
 }
