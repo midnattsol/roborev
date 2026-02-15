@@ -468,7 +468,7 @@ func (b *Builder) writeContextFiles(sb *strings.Builder, repoPath string, patter
 		}
 		if maxRead <= 0 {
 			truncated = true
-			break
+			continue // try remaining files - shorter paths may still fit
 		}
 
 		// Open, verify, read, and close file - one at a time to avoid FD exhaustion
@@ -596,14 +596,21 @@ const maxDisplayPathLength = 500
 func sanitizeDisplayPath(path string) string {
 	var sb strings.Builder
 	sb.Grow(len(path))
-	for _, r := range path {
+	runes := []rune(path)
+	for i, r := range runes {
 		if isUnsafePathChar(r) {
 			sb.WriteRune('_')
 		} else {
 			sb.WriteRune(r)
 		}
-		// Enforce max length
-		if sb.Len() >= maxDisplayPathLength {
+		// Enforce max length - only truncate if we exceed AND there's more input
+		if sb.Len() > maxDisplayPathLength {
+			// Rewind to limit and add ellipsis
+			result := sb.String()[:maxDisplayPathLength] + "..."
+			return result
+		}
+		// At exactly maxDisplayPathLength with more input remaining
+		if sb.Len() == maxDisplayPathLength && i < len(runes)-1 {
 			sb.WriteString("...")
 			break
 		}

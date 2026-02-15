@@ -1663,3 +1663,72 @@ func TestBuildAddressPromptWithContextFiles(t *testing.T) {
 		t.Error("Address prompt should contain review findings section")
 	}
 }
+
+func TestSanitizeDisplayPathExactBoundary(t *testing.T) {
+	// Create a path exactly at maxDisplayPathLength - should NOT be truncated
+	exactPath := strings.Repeat("a", maxDisplayPathLength)
+
+	result := sanitizeDisplayPath(exactPath)
+
+	// Should be exactly the same - no truncation, no "..."
+	if result != exactPath {
+		t.Errorf("Path at exact max length should not be modified.\nExpected: %d chars\nGot: %d chars (ends with %q)",
+			len(exactPath), len(result), result[len(result)-10:])
+	}
+
+	if strings.HasSuffix(result, "...") {
+		t.Error("Path at exact max length should not have '...' suffix")
+	}
+}
+
+func TestBuildPromptLongPathSkippedShortPathIncluded(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a deeply nested directory with a very long path
+	// This path will consume too much budget overhead
+	deepPath := repoPath
+	for i := 0; i < 25; i++ {
+		deepPath = filepath.Join(deepPath, fmt.Sprintf("very_long_directory_name_segment_%d", i))
+	}
+	if err := os.MkdirAll(deepPath, 0755); err != nil {
+		t.Fatalf("Failed to create deep directory: %v", err)
+	}
+	longPathFile := filepath.Join(deepPath, "long_path_file.md")
+	if err := os.WriteFile(longPathFile, []byte("Long path content"), 0644); err != nil {
+		t.Fatalf("Failed to write long path file: %v", err)
+	}
+
+	// Create a short-path file
+	shortFile := filepath.Join(repoPath, "short.md")
+	if err := os.WriteFile(shortFile, []byte("Short path content"), 0644); err != nil {
+		t.Fatalf("Failed to write short file: %v", err)
+	}
+
+	// Get relative paths
+	longRelPath, _ := filepath.Rel(repoPath, longPathFile)
+	shortRelPath := "short.md"
+
+	// Configure with long-path file FIRST, then short-path file
+	// The long-path file may be skipped due to budget, but short-path should still be included
+	configContent := fmt.Sprintf(`context_files = [%q, %q]`, longRelPath, shortRelPath)
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	// The short-path file should definitely be included
+	if !strings.Contains(prompt, "Short path content") {
+		t.Error("Short-path file should be included even if long-path file is skipped")
+	}
+
+	// Verify context files section exists
+	if !strings.Contains(prompt, "## Context Files") {
+		t.Error("Context files section should be present")
+	}
+}
