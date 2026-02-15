@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"github.com/roborev-dev/roborev/internal/config"
 	"github.com/roborev-dev/roborev/internal/git"
@@ -449,8 +450,8 @@ func (b *Builder) writeContextFiles(sb *strings.Builder, repoPath string, patter
 		return
 	}
 
-	// Conservative overhead for heading (path up to ~150 chars) + fence (up to ~20 backticks) + margins
-	const perFileOverhead = 250
+	// Reserve space for section header
+	headerLen := len(ContextFilesHeader) + 1
 
 	var content strings.Builder
 	wroteAny := false
@@ -459,15 +460,19 @@ func (b *Builder) writeContextFiles(sb *strings.Builder, repoPath string, patter
 	for i := range entries {
 		entry := &entries[i]
 
-		// Calculate remaining budget: content.Len() includes header once written
-		remaining := budget - content.Len() - perFileOverhead
-		if remaining <= 0 {
+		// Estimate max read size conservatively (will verify exact fit after reading)
+		estimatedOverhead := len(entry.displayPath) + 50 // path + fence + markdown
+		maxRead := budget - content.Len() - estimatedOverhead
+		if !wroteAny {
+			maxRead -= headerLen
+		}
+		if maxRead <= 0 {
 			truncated = true
 			break
 		}
 
 		// Open, verify, read, and close file - one at a time to avoid FD exhaustion
-		data, err := readContextFileWithTOCTOUCheck(entry.resolvedPath, entry.validatedInfo, remaining)
+		data, err := readContextFileWithTOCTOUCheck(entry.resolvedPath, entry.validatedInfo, maxRead)
 		if err != nil {
 			log.Printf("Warning: failed to read context file %s: %v", entry.displayPath, err)
 			continue
@@ -483,9 +488,22 @@ func (b *Builder) writeContextFiles(sb *strings.Builder, repoPath string, patter
 			continue
 		}
 
-		// Use plain text heading - path is already sanitized (no control chars)
+		// Build heading and closing with exact lengths
 		heading := fmt.Sprintf("### %s\n\n%s\n", entry.displayPath, fence)
 		closing := fmt.Sprintf("\n%s\n\n", fence)
+
+		// Calculate exact total size for this entry
+		entrySize := len(heading) + len(fileContent) + len(closing)
+		totalAfterWrite := content.Len() + entrySize
+		if !wroteAny {
+			totalAfterWrite += headerLen
+		}
+
+		// Verify exact budget compliance before writing
+		if totalAfterWrite > budget {
+			truncated = true
+			break
+		}
 
 		// Write header on first successful file
 		if !wroteAny {
@@ -569,18 +587,50 @@ func fenceForContent(content string) (string, bool) {
 	return strings.Repeat("`", fenceLen), true
 }
 
-// sanitizeDisplayPath removes control characters that could break prompt structure
+// maxDisplayPathLength is the maximum allowed length for display paths.
+// Paths longer than this are truncated to prevent budget issues.
+const maxDisplayPathLength = 500
+
+// sanitizeDisplayPath removes control characters and bidi formatting that could
+// break prompt structure or cause visual spoofing. Also enforces max length.
 func sanitizeDisplayPath(path string) string {
 	var sb strings.Builder
 	sb.Grow(len(path))
 	for _, r := range path {
-		if r < 32 || r == 127 { // ASCII control characters
+		if isUnsafePathChar(r) {
 			sb.WriteRune('_')
 		} else {
 			sb.WriteRune(r)
 		}
+		// Enforce max length
+		if sb.Len() >= maxDisplayPathLength {
+			sb.WriteString("...")
+			break
+		}
 	}
 	return sb.String()
+}
+
+// isUnsafePathChar returns true for characters that should be sanitized from display paths
+func isUnsafePathChar(r rune) bool {
+	// ASCII control characters
+	if r < 32 || r == 127 {
+		return true
+	}
+	// Unicode control characters
+	if unicode.IsControl(r) {
+		return true
+	}
+	// Bidi formatting characters (can cause visual spoofing)
+	if (r >= 0x202A && r <= 0x202E) || // LRE, RLE, PDF, LRO, RLO
+		(r >= 0x2066 && r <= 0x2069) { // LRI, RLI, FSI, PDI
+		return true
+	}
+	// Unicode line/paragraph separators
+	if r == 0x2028 || r == 0x2029 {
+		return true
+	}
+	return false
 }
 
 // collectContextEntries resolves patterns to validated context entries.

@@ -1,6 +1,7 @@
 package prompt
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1374,23 +1375,107 @@ func TestBuildPromptWithUnfenceableContent(t *testing.T) {
 
 func TestSanitizeDisplayPath(t *testing.T) {
 	tests := []struct {
+		name     string
 		input    string
 		expected string
 	}{
-		{"normal/path.md", "normal/path.md"},
-		{"path\nwith\nnewlines.md", "path_with_newlines.md"},
-		{"path\rwith\rcarriage.md", "path_with_carriage.md"},
-		{"path\twith\ttabs.md", "path_with_tabs.md"},
-		{"path\x00with\x1fnull.md", "path_with_null.md"},
-		{"path\x7fwith\x7fdel.md", "path_with_del.md"},
-		{"", ""},
-		{"../traversal/attempt", "../traversal/attempt"}, // dots are fine, just control chars sanitized
+		{"normal path", "normal/path.md", "normal/path.md"},
+		{"newlines", "path\nwith\nnewlines.md", "path_with_newlines.md"},
+		{"carriage returns", "path\rwith\rcarriage.md", "path_with_carriage.md"},
+		{"tabs", "path\twith\ttabs.md", "path_with_tabs.md"},
+		{"null and control", "path\x00with\x1fnull.md", "path_with_null.md"},
+		{"DEL char", "path\x7fwith\x7fdel.md", "path_with_del.md"},
+		{"empty", "", ""},
+		{"traversal dots ok", "../traversal/attempt", "../traversal/attempt"},
+		// Unicode control characters
+		{"unicode line separator", "path\u2028sep.md", "path_sep.md"},
+		{"unicode paragraph separator", "path\u2029sep.md", "path_sep.md"},
+		// Bidi formatting characters
+		{"bidi LRE", "path\u202Abidi.md", "path_bidi.md"},
+		{"bidi RLE", "path\u202Bbidi.md", "path_bidi.md"},
+		{"bidi PDF", "path\u202Cbidi.md", "path_bidi.md"},
+		{"bidi LRO", "path\u202Dbidi.md", "path_bidi.md"},
+		{"bidi RLO", "path\u202Ebidi.md", "path_bidi.md"},
+		{"bidi LRI", "path\u2066bidi.md", "path_bidi.md"},
+		{"bidi RLI", "path\u2067bidi.md", "path_bidi.md"},
+		{"bidi FSI", "path\u2068bidi.md", "path_bidi.md"},
+		{"bidi PDI", "path\u2069bidi.md", "path_bidi.md"},
 	}
 
 	for _, tt := range tests {
-		result := sanitizeDisplayPath(tt.input)
-		if result != tt.expected {
-			t.Errorf("sanitizeDisplayPath(%q) = %q, want %q", tt.input, result, tt.expected)
+		t.Run(tt.name, func(t *testing.T) {
+			result := sanitizeDisplayPath(tt.input)
+			if result != tt.expected {
+				t.Errorf("sanitizeDisplayPath(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSanitizeDisplayPathTruncation(t *testing.T) {
+	// Create a very long path
+	longPath := strings.Repeat("a/", 300) + "file.md"
+
+	result := sanitizeDisplayPath(longPath)
+
+	// Should be truncated to maxDisplayPathLength + "..."
+	if len(result) > maxDisplayPathLength+3 {
+		t.Errorf("sanitizeDisplayPath should truncate long paths, got length %d", len(result))
+	}
+
+	if !strings.HasSuffix(result, "...") {
+		t.Error("Truncated path should end with '...'")
+	}
+}
+
+func TestBuildPromptWithVeryLongPath(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a deeply nested directory structure with long names
+	deepPath := repoPath
+	for i := 0; i < 20; i++ {
+		deepPath = filepath.Join(deepPath, fmt.Sprintf("very_long_directory_name_%d", i))
+	}
+	if err := os.MkdirAll(deepPath, 0755); err != nil {
+		t.Fatalf("Failed to create deep directory: %v", err)
+	}
+
+	// Create a file with a long name in the deep directory
+	longFileName := strings.Repeat("long_", 20) + "file.md"
+	longFile := filepath.Join(deepPath, longFileName)
+	if err := os.WriteFile(longFile, []byte("Content in deeply nested file"), 0644); err != nil {
+		t.Fatalf("Failed to write file: %v", err)
+	}
+
+	// Get relative path for config
+	relPath, _ := filepath.Rel(repoPath, longFile)
+
+	// Create .roborev.toml
+	configContent := fmt.Sprintf(`context_files = [%q]`, relPath)
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	// Should contain the file content
+	if !strings.Contains(prompt, "Content in deeply nested file") {
+		t.Error("Prompt should contain content from deeply nested file")
+	}
+
+	// Context section should not exceed a reasonable size
+	// (this is a sanity check - exact budget enforcement is tested elsewhere)
+	contextStart := strings.Index(prompt, "## Context Files")
+	if contextStart != -1 {
+		contextSection := prompt[contextStart:]
+		// Context budget is MaxPromptSize/4 ≈ 62KB, should be well under
+		if len(contextSection) > MaxPromptSize/4+1000 { // allow small margin for truncation message
+			t.Errorf("Context section too large: %d bytes", len(contextSection))
 		}
 	}
 }
