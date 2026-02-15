@@ -594,7 +594,11 @@ const maxDisplayPathLength = 500
 
 // sanitizeDisplayPath removes control characters and bidi formatting that could
 // break prompt structure or cause visual spoofing. Also enforces max length.
+// Output is guaranteed to be at most maxDisplayPathLength bytes.
 func sanitizeDisplayPath(path string) string {
+	const ellipsis = "..."
+	maxContent := maxDisplayPathLength - len(ellipsis) // reserve space for ellipsis
+
 	var sb strings.Builder
 	sb.Grow(len(path))
 	for _, r := range path {
@@ -602,9 +606,9 @@ func sanitizeDisplayPath(path string) string {
 		if isUnsafePathChar(r) {
 			toWrite = '_'
 		}
-		// Check if adding this rune would exceed max length (UTF-8 safe)
-		if sb.Len()+utf8.RuneLen(toWrite) > maxDisplayPathLength {
-			sb.WriteString("...")
+		// Check if adding this rune would exceed content limit (UTF-8 safe)
+		if sb.Len()+utf8.RuneLen(toWrite) > maxContent {
+			sb.WriteString(ellipsis)
 			return sb.String()
 		}
 		sb.WriteRune(toWrite)

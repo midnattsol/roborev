@@ -1666,34 +1666,52 @@ func TestBuildAddressPromptWithContextFiles(t *testing.T) {
 }
 
 func TestSanitizeDisplayPathExactBoundary(t *testing.T) {
-	// Create a path exactly at maxDisplayPathLength - should NOT be truncated
-	exactPath := strings.Repeat("a", maxDisplayPathLength)
+	// Max content is maxDisplayPathLength - 3 (reserving space for "...")
+	maxContent := maxDisplayPathLength - 3 // 497 bytes
+
+	// Create a path exactly at max content length - should NOT be truncated
+	exactPath := strings.Repeat("a", maxContent)
 
 	result := sanitizeDisplayPath(exactPath)
 
 	// Should be exactly the same - no truncation, no "..."
 	if result != exactPath {
-		t.Errorf("Path at exact max length should not be modified.\nExpected: %d chars\nGot: %d chars (ends with %q)",
-			len(exactPath), len(result), result[len(result)-10:])
+		t.Errorf("Path at exact max content length should not be modified.\nExpected: %d chars\nGot: %d chars",
+			len(exactPath), len(result))
 	}
 
 	if strings.HasSuffix(result, "...") {
-		t.Error("Path at exact max length should not have '...' suffix")
+		t.Error("Path at exact max content length should not have '...' suffix")
+	}
+
+	// One byte over content limit should trigger truncation
+	overPath := exactPath + "x"
+	result = sanitizeDisplayPath(overPath)
+
+	if !strings.HasSuffix(result, "...") {
+		t.Error("Path exceeding max content should end with '...'")
+	}
+
+	// Output should be at most maxDisplayPathLength bytes
+	if len(result) > maxDisplayPathLength {
+		t.Errorf("Truncated result should be <= %d bytes, got %d", maxDisplayPathLength, len(result))
 	}
 }
 
 func TestSanitizeDisplayPathMultiByteUTF8(t *testing.T) {
-	// "日" is 3 bytes in UTF-8. 166 * 3 = 498 bytes, + "aa" = 500 bytes exactly
-	exactPath := strings.Repeat("日", 166) + "aa"
-	if len(exactPath) != maxDisplayPathLength {
-		t.Fatalf("Test setup wrong: expected %d bytes, got %d", maxDisplayPathLength, len(exactPath))
+	maxContent := maxDisplayPathLength - 3 // 497 bytes for content
+
+	// "日" is 3 bytes in UTF-8. 165 * 3 = 495 bytes, + "aa" = 497 bytes exactly at max content
+	exactPath := strings.Repeat("日", 165) + "aa"
+	if len(exactPath) != maxContent {
+		t.Fatalf("Test setup wrong: expected %d bytes, got %d", maxContent, len(exactPath))
 	}
 
 	result := sanitizeDisplayPath(exactPath)
 
-	// Should be unchanged - exactly at limit
+	// Should be unchanged - exactly at content limit
 	if result != exactPath {
-		t.Errorf("Path at exact max byte length should not be modified, got %d bytes", len(result))
+		t.Errorf("Path at exact max content length should not be modified, got %d bytes", len(result))
 	}
 
 	// One more byte would exceed - should truncate cleanly
@@ -1709,10 +1727,15 @@ func TestSanitizeDisplayPathMultiByteUTF8(t *testing.T) {
 		t.Error("Result should be valid UTF-8, truncation may have split a multi-byte character")
 	}
 
+	// Output should be at most maxDisplayPathLength
+	if len(result) > maxDisplayPathLength {
+		t.Errorf("Truncated result should be <= %d bytes, got %d", maxDisplayPathLength, len(result))
+	}
+
 	// Test case where multi-byte char would cross boundary
-	// 499 bytes of ASCII + one 3-byte char = would be 502 bytes
+	// 496 bytes of ASCII + one 3-byte char = would be 499 bytes (exceeds 497 content limit)
 	// Should truncate before adding the multi-byte char
-	almostFull := strings.Repeat("a", 499)
+	almostFull := strings.Repeat("a", 496)
 	withMultiByte := almostFull + "日"
 	result = sanitizeDisplayPath(withMultiByte)
 
@@ -1725,10 +1748,15 @@ func TestSanitizeDisplayPathMultiByteUTF8(t *testing.T) {
 		t.Error("Should truncate when multi-byte char won't fit in remaining budget")
 	}
 
-	// The result should be the 499 'a's plus "..."
+	// The result should be the 496 'a's plus "..." = 499 bytes (within 500 limit)
 	expected := almostFull + "..."
 	if result != expected {
-		t.Errorf("Expected %d bytes, got %d bytes", len(expected), len(result))
+		t.Errorf("Expected %q, got %q", expected, result)
+	}
+
+	// Verify output respects max length
+	if len(result) > maxDisplayPathLength {
+		t.Errorf("Result should be <= %d bytes, got %d", maxDisplayPathLength, len(result))
 	}
 }
 
