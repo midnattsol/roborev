@@ -4,10 +4,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/roborev-dev/roborev/internal/storage"
 	"github.com/roborev-dev/roborev/internal/testutil"
 )
 
@@ -630,5 +632,949 @@ func TestBuildRangeWithReviewAlias(t *testing.T) {
 	// Should use the range system prompt, not single-commit
 	if !strings.Contains(prompt, "commit range") {
 		t.Error("Expected range system prompt for reviewType=review alias, got wrong prompt type")
+	}
+}
+
+func TestBuildPromptWithContextFiles(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create context files
+	docsDir := filepath.Join(repoPath, "docs", "adr")
+	if err := os.MkdirAll(docsDir, 0755); err != nil {
+		t.Fatalf("Failed to create docs dir: %v", err)
+	}
+
+	adr1 := filepath.Join(docsDir, "001-use-go.md")
+	if err := os.WriteFile(adr1, []byte("# ADR 001: Use Go\n\nWe chose Go for performance."), 0644); err != nil {
+		t.Fatalf("Failed to write ADR: %v", err)
+	}
+
+	adr2 := filepath.Join(docsDir, "002-rest-api.md")
+	if err := os.WriteFile(adr2, []byte("# ADR 002: REST API\n\nWe use REST for simplicity."), 0644); err != nil {
+		t.Fatalf("Failed to write ADR: %v", err)
+	}
+
+	// Create .roborev.toml with context_files
+	configContent := `context_files = ["docs/adr/*.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	if !strings.Contains(prompt, "## Context Files") {
+		t.Error("Prompt should contain context files section")
+	}
+
+	if !strings.Contains(prompt, "ADR 001: Use Go") {
+		t.Error("Prompt should contain ADR 001 content")
+	}
+
+	if !strings.Contains(prompt, "ADR 002: REST API") {
+		t.Error("Prompt should contain ADR 002 content")
+	}
+}
+
+func TestBuildPromptWithContextFilesOrder(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a context file
+	archFile := filepath.Join(repoPath, "ARCHITECTURE.md")
+	if err := os.WriteFile(archFile, []byte("# Architecture\n\nHexagonal architecture."), 0644); err != nil {
+		t.Fatalf("Failed to write file: %v", err)
+	}
+
+	// Create .roborev.toml with both guidelines and context_files
+	configContent := `
+review_guidelines = "Be thorough"
+context_files = ["ARCHITECTURE.md"]
+`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	guidelinesPos := strings.Index(prompt, "## Project Guidelines")
+	contextFilesPos := strings.Index(prompt, "## Context Files")
+	currentCommitPos := strings.Index(prompt, "## Current Commit")
+
+	if guidelinesPos == -1 {
+		t.Fatal("Guidelines section not found")
+	}
+	if contextFilesPos == -1 {
+		t.Fatal("Context files section not found")
+	}
+
+	if guidelinesPos > contextFilesPos {
+		t.Error("Guidelines should come before context files")
+	}
+	if contextFilesPos > currentCommitPos {
+		t.Error("Context files should come before current commit")
+	}
+}
+
+func TestBuildPromptWithMissingContextFile(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create .roborev.toml with a non-existent file
+	configContent := `context_files = ["DOES_NOT_EXIST.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	// Should not fail, just skip the missing file
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple should not fail with missing context file: %v", err)
+	}
+
+	// Should not contain context files section since file was skipped
+	if strings.Contains(prompt, "## Context Files") {
+		t.Error("Prompt should not contain context files section when all files are missing")
+	}
+
+	// Should still have the standard sections
+	if !strings.Contains(prompt, "## Current Commit") {
+		t.Error("Prompt should still contain current commit section")
+	}
+}
+
+func TestBuildPromptWithEmptyGlobMatch(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create .roborev.toml with a glob that matches nothing
+	configContent := `context_files = ["nonexistent/*.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	// Should not fail
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple should not fail with empty glob: %v", err)
+	}
+
+	// Should not contain context files section
+	if strings.Contains(prompt, "## Context Files") {
+		t.Error("Prompt should not contain context files section when glob matches nothing")
+	}
+}
+
+func TestBuildPromptWithPathTraversal(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a file outside repo (in parent dir)
+	parentDir := filepath.Dir(repoPath)
+	secretFile := filepath.Join(parentDir, "secret.txt")
+	if err := os.WriteFile(secretFile, []byte("SECRET DATA"), 0644); err != nil {
+		t.Fatalf("Failed to write secret file: %v", err)
+	}
+	defer os.Remove(secretFile)
+
+	// Create .roborev.toml with path traversal attempt
+	configContent := `context_files = ["../secret.txt"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple should not fail: %v", err)
+	}
+
+	// Should NOT contain the secret file content
+	if strings.Contains(prompt, "SECRET DATA") {
+		t.Error("Prompt should not contain content from files outside repo")
+	}
+
+	// Should NOT contain context files section
+	if strings.Contains(prompt, "## Context Files") {
+		t.Error("Prompt should not contain context files section when all files are outside repo")
+	}
+}
+
+func TestBuildPromptWithDeduplication(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a file
+	archFile := filepath.Join(repoPath, "ARCHITECTURE.md")
+	if err := os.WriteFile(archFile, []byte("# Architecture\n\nUnique content here."), 0644); err != nil {
+		t.Fatalf("Failed to write file: %v", err)
+	}
+
+	// Create .roborev.toml with same file via glob and explicit path
+	configContent := `context_files = ["*.md", "ARCHITECTURE.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	// Count occurrences of the unique content - should appear only once
+	count := strings.Count(prompt, "Unique content here.")
+	if count != 1 {
+		t.Errorf("Expected file content to appear once (deduplicated), got %d occurrences", count)
+	}
+}
+
+func TestBuildPromptWithLargeContextTruncation(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a large file that exceeds budget
+	largeContent := strings.Repeat("x", 100*1024) // 100KB
+	largeFile := filepath.Join(repoPath, "large.md")
+	if err := os.WriteFile(largeFile, []byte(largeContent), 0644); err != nil {
+		t.Fatalf("Failed to write large file: %v", err)
+	}
+
+	// Create another file that won't fit
+	secondFile := filepath.Join(repoPath, "second.md")
+	if err := os.WriteFile(secondFile, []byte("Second file content"), 0644); err != nil {
+		t.Fatalf("Failed to write second file: %v", err)
+	}
+
+	// Create .roborev.toml
+	configContent := `context_files = ["large.md", "second.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	// Should contain truncation message
+	if !strings.Contains(prompt, "context truncated") {
+		t.Error("Prompt should contain truncation message when context is too large")
+	}
+
+	// Should still have standard sections
+	if !strings.Contains(prompt, "## Current Commit") {
+		t.Error("Prompt should still contain current commit section")
+	}
+}
+
+func TestBuildPromptWithSymlinkEscape(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Symlink test not supported on Windows")
+	}
+
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a file outside repo
+	parentDir := filepath.Dir(repoPath)
+	secretFile := filepath.Join(parentDir, "external_secret.txt")
+	if err := os.WriteFile(secretFile, []byte("EXTERNAL SECRET DATA"), 0644); err != nil {
+		t.Fatalf("Failed to write external file: %v", err)
+	}
+	defer os.Remove(secretFile)
+
+	// Create symlink inside repo pointing to the external file
+	symlinkPath := filepath.Join(repoPath, "link_to_secret.txt")
+	if err := os.Symlink(secretFile, symlinkPath); err != nil {
+		t.Fatalf("Failed to create symlink: %v", err)
+	}
+
+	// Create .roborev.toml referencing the symlink
+	configContent := `context_files = ["link_to_secret.txt"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple should not fail: %v", err)
+	}
+
+	// Should NOT contain the external file content
+	if strings.Contains(prompt, "EXTERNAL SECRET DATA") {
+		t.Error("Prompt should not contain content from symlinks pointing outside repo")
+	}
+
+	// Should NOT contain context files section since symlink was rejected
+	if strings.Contains(prompt, "## Context Files") {
+		t.Error("Prompt should not contain context files section when symlink points outside")
+	}
+}
+
+func TestBuildPromptWithOversizedFileBoundedRead(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a very large file (larger than context budget)
+	largeContent := strings.Repeat("LARGE_FILE_CONTENT_", 50000) // ~950KB
+	largeFile := filepath.Join(repoPath, "huge.md")
+	if err := os.WriteFile(largeFile, []byte(largeContent), 0644); err != nil {
+		t.Fatalf("Failed to write large file: %v", err)
+	}
+
+	// Create .roborev.toml
+	configContent := `context_files = ["huge.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	// Should not panic or OOM
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	// Should still have standard sections
+	if !strings.Contains(prompt, "## Current Commit") {
+		t.Error("Prompt should still contain current commit section")
+	}
+
+	// File content should be truncated (not all of it present)
+	if strings.Contains(prompt, largeContent) {
+		t.Error("Prompt should not contain full oversized file content")
+	}
+}
+
+func TestBuildPromptWithBrokenSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Symlink test not supported on Windows")
+	}
+
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a symlink to a non-existent file
+	brokenLink := filepath.Join(repoPath, "broken_link.md")
+	if err := os.Symlink("/nonexistent/path/file.txt", brokenLink); err != nil {
+		t.Fatalf("Failed to create broken symlink: %v", err)
+	}
+
+	// Create a valid file to include
+	validFile := filepath.Join(repoPath, "valid.md")
+	if err := os.WriteFile(validFile, []byte("VALID_CONTENT"), 0644); err != nil {
+		t.Fatalf("Failed to write valid file: %v", err)
+	}
+
+	// Create .roborev.toml referencing both
+	configContent := `context_files = ["broken_link.md", "valid.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple should not fail: %v", err)
+	}
+
+	// Should NOT contain broken symlink but SHOULD contain valid file
+	if !strings.Contains(prompt, "VALID_CONTENT") {
+		t.Error("Prompt should contain valid file content")
+	}
+
+	if !strings.Contains(prompt, "## Context Files") {
+		t.Error("Prompt should contain context files section for valid file")
+	}
+}
+
+func TestBuildPromptWithDirectoryInContextFiles(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a directory (which should be rejected)
+	subDir := filepath.Join(repoPath, "docs")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatalf("Failed to create directory: %v", err)
+	}
+
+	// Create a valid file
+	validFile := filepath.Join(repoPath, "valid.md")
+	if err := os.WriteFile(validFile, []byte("VALID_DOC"), 0644); err != nil {
+		t.Fatalf("Failed to write valid file: %v", err)
+	}
+
+	// Create .roborev.toml referencing directory and file
+	configContent := `context_files = ["docs", "valid.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple should not fail: %v", err)
+	}
+
+	// Should contain valid file but not directory listing
+	if !strings.Contains(prompt, "VALID_DOC") {
+		t.Error("Prompt should contain valid file content")
+	}
+}
+
+func TestBuildPromptWithSymlinkChainEscape(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Symlink test not supported on Windows")
+	}
+
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a file outside repo
+	parentDir := filepath.Dir(repoPath)
+	secretFile := filepath.Join(parentDir, "chain_secret.txt")
+	if err := os.WriteFile(secretFile, []byte("CHAIN_SECRET_DATA"), 0644); err != nil {
+		t.Fatalf("Failed to write external file: %v", err)
+	}
+	defer os.Remove(secretFile)
+
+	// Create a chain of symlinks: link1 -> link2 -> external file
+	link2 := filepath.Join(repoPath, "link2.txt")
+	if err := os.Symlink(secretFile, link2); err != nil {
+		t.Fatalf("Failed to create link2: %v", err)
+	}
+
+	link1 := filepath.Join(repoPath, "link1.txt")
+	if err := os.Symlink(link2, link1); err != nil {
+		t.Fatalf("Failed to create link1: %v", err)
+	}
+
+	// Create .roborev.toml referencing the first link in the chain
+	configContent := `context_files = ["link1.txt"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple should not fail: %v", err)
+	}
+
+	// Should NOT contain the external file content (chain resolves outside repo)
+	if strings.Contains(prompt, "CHAIN_SECRET_DATA") {
+		t.Error("Prompt should not contain content from symlink chain pointing outside repo")
+	}
+
+	// Should NOT contain context files section since symlink was rejected
+	if strings.Contains(prompt, "## Context Files") {
+		t.Error("Prompt should not contain context files section when symlink chain points outside")
+	}
+}
+
+func TestBuildPromptWithSymlinkedRepoRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Symlink test not supported on Windows")
+	}
+
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a context file in the real repo
+	contextFile := filepath.Join(repoPath, "context.md")
+	if err := os.WriteFile(contextFile, []byte("SYMLINKED_REPO_CONTEXT"), 0644); err != nil {
+		t.Fatalf("Failed to write context file: %v", err)
+	}
+
+	// Create .roborev.toml
+	configContent := `context_files = ["context.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	// Create a symlink to the repo in the parent directory
+	parentDir := filepath.Dir(repoPath)
+	symlinkRepo := filepath.Join(parentDir, "symlinked_repo")
+	if err := os.Symlink(repoPath, symlinkRepo); err != nil {
+		t.Fatalf("Failed to create symlink to repo: %v", err)
+	}
+	defer os.Remove(symlinkRepo)
+
+	// Build prompt using the symlinked path
+	prompt, err := BuildSimple(symlinkRepo, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple should not fail with symlinked repo path: %v", err)
+	}
+
+	// Should contain the context file content even when accessed via symlink
+	if !strings.Contains(prompt, "SYMLINKED_REPO_CONTEXT") {
+		t.Error("Prompt should contain context file content when repo is accessed via symlink")
+	}
+
+	if !strings.Contains(prompt, "## Context Files") {
+		t.Error("Prompt should contain context files section when accessed via symlinked repo")
+	}
+}
+
+func TestBuildPromptWithDotDotFilename(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a file with .. prefix in name (valid filename, not traversal)
+	dotDotFile := filepath.Join(repoPath, "..notes.md")
+	if err := os.WriteFile(dotDotFile, []byte("DOTDOT_FILENAME_CONTENT"), 0644); err != nil {
+		t.Fatalf("Failed to write ..notes.md file: %v", err)
+	}
+
+	// Create .roborev.toml referencing this file
+	configContent := `context_files = ["..notes.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple should not fail: %v", err)
+	}
+
+	// Should contain the file content (it's a valid in-repo file, not traversal)
+	if !strings.Contains(prompt, "DOTDOT_FILENAME_CONTENT") {
+		t.Error("Prompt should contain content from ..notes.md (valid filename, not traversal)")
+	}
+
+	if !strings.Contains(prompt, "## Context Files") {
+		t.Error("Prompt should contain context files section for ..notes.md")
+	}
+}
+
+func TestBuildPromptWithAbsolutePathInConfig(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create .roborev.toml with absolute path style entry
+	// Note: filepath.Join(repoAbs, "/etc/passwd") normalizes to <repoAbs>/etc/passwd
+	// so this tests that such a non-existent in-repo path is handled gracefully
+	configContent := `context_files = ["/etc/passwd"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple should not fail: %v", err)
+	}
+
+	// Should NOT contain /etc/passwd content (file doesn't exist at <repo>/etc/passwd)
+	if strings.Contains(prompt, "root:") {
+		t.Error("Prompt should not contain /etc/passwd content")
+	}
+
+	// No context files section since file doesn't exist
+	if strings.Contains(prompt, "## Context Files") {
+		t.Error("Prompt should not contain context files section for non-existent path")
+	}
+}
+
+func TestIsInsideRepo(t *testing.T) {
+	repoAbs := "/home/user/repo"
+
+	tests := []struct {
+		name       string
+		targetPath string
+		want       bool
+	}{
+		{"absolute path outside repo", "/etc/passwd", false},
+		{"absolute path inside repo", "/home/user/repo/file.md", true},
+		{"relative path inside repo", "/home/user/repo/docs/adr.md", true},
+		{"traversal attempt", "/home/user/repo/../other/file.md", false},
+		{"parent directory", "/home/user", false},
+		{"sibling directory", "/home/user/other-repo/file.md", false},
+		{"dotdot filename inside repo", "/home/user/repo/..notes.md", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isInsideRepo(repoAbs, tt.targetPath)
+			if got != tt.want {
+				t.Errorf("isInsideRepo(%q, %q) = %v, want %v", repoAbs, tt.targetPath, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildPromptWithSymlinkDeduplication(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Symlink test not supported on Windows")
+	}
+
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a real file
+	realFile := filepath.Join(repoPath, "real.md")
+	if err := os.WriteFile(realFile, []byte("DEDUP_CONTENT"), 0644); err != nil {
+		t.Fatalf("Failed to write real file: %v", err)
+	}
+
+	// Create a symlink to the same file within the repo
+	symlinkFile := filepath.Join(repoPath, "link.md")
+	if err := os.Symlink(realFile, symlinkFile); err != nil {
+		t.Fatalf("Failed to create symlink: %v", err)
+	}
+
+	// Create .roborev.toml referencing both (should dedupe)
+	configContent := `context_files = ["real.md", "link.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	// Content should appear exactly once (deduplicated by resolved path)
+	count := strings.Count(prompt, "DEDUP_CONTENT")
+	if count != 1 {
+		t.Errorf("Expected content to appear once (deduplicated), got %d occurrences", count)
+	}
+}
+
+func TestBuildPromptWithBackticksInContextFile(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a file with triple backticks that could break fencing
+	contentWithBackticks := "# Example\n\n```go\nfunc main() {}\n```\n\nMore text after code block."
+	backtickFile := filepath.Join(repoPath, "example.md")
+	if err := os.WriteFile(backtickFile, []byte(contentWithBackticks), 0644); err != nil {
+		t.Fatalf("Failed to write file with backticks: %v", err)
+	}
+
+	// Create .roborev.toml
+	configContent := `context_files = ["example.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	// Should contain the full content including the inner backticks
+	if !strings.Contains(prompt, "```go") {
+		t.Error("Prompt should contain the inner code fence from context file")
+	}
+	if !strings.Contains(prompt, "More text after code block") {
+		t.Error("Prompt should contain text after inner code fence")
+	}
+
+	// Should use a longer fence (4+ backticks) to encapsulate the content
+	if !strings.Contains(prompt, "````") {
+		t.Error("Prompt should use extended fence (4+ backticks) when content contains triple backticks")
+	}
+
+	// The content should be properly encapsulated (verify structure)
+	if !strings.Contains(prompt, "## Context Files") {
+		t.Error("Prompt should contain context files section")
+	}
+}
+
+func TestFenceForContent(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		wantOk  bool
+		wantLen int // expected fence length if ok
+	}{
+		{"no backticks", "hello world", true, 3},
+		{"single backtick", "hello `world`", true, 3},
+		{"triple backticks", "```code```", true, 4},
+		{"9 backticks", "`````````", true, 10},
+		{"10 backticks (at limit)", "``````````", false, 0},
+		{"many backticks", strings.Repeat("`", 50), false, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fence, ok := fenceForContent(tt.content)
+			if ok != tt.wantOk {
+				t.Errorf("fenceForContent() ok = %v, want %v", ok, tt.wantOk)
+			}
+			if ok && len(fence) != tt.wantLen {
+				t.Errorf("fenceForContent() fence length = %d, want %d", len(fence), tt.wantLen)
+			}
+		})
+	}
+}
+
+func TestBuildPromptWithUnfenceableContent(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a file with too many consecutive backticks (unfenceable)
+	unfenceableContent := strings.Repeat("`", 15) + "\nSome content"
+	unfenceableFile := filepath.Join(repoPath, "unfenceable.md")
+	if err := os.WriteFile(unfenceableFile, []byte(unfenceableContent), 0644); err != nil {
+		t.Fatalf("Failed to write file: %v", err)
+	}
+
+	// Create a normal file
+	normalFile := filepath.Join(repoPath, "normal.md")
+	if err := os.WriteFile(normalFile, []byte("Normal content"), 0644); err != nil {
+		t.Fatalf("Failed to write file: %v", err)
+	}
+
+	// Create .roborev.toml with both files
+	configContent := `context_files = ["unfenceable.md", "normal.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	// Should NOT contain the unfenceable file content
+	if strings.Contains(prompt, strings.Repeat("`", 15)) {
+		t.Error("Prompt should not contain unfenceable file content")
+	}
+
+	// Should contain the normal file content
+	if !strings.Contains(prompt, "Normal content") {
+		t.Error("Prompt should contain normal file content")
+	}
+
+	// Should have context files section (for the normal file)
+	if !strings.Contains(prompt, "## Context Files") {
+		t.Error("Prompt should contain context files section")
+	}
+}
+
+func TestSanitizeDisplayPath(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"normal/path.md", "normal/path.md"},
+		{"path\nwith\nnewlines.md", "path_with_newlines.md"},
+		{"path\rwith\rcarriage.md", "path_with_carriage.md"},
+		{"path\twith\ttabs.md", "path_with_tabs.md"},
+		{"path\x00with\x1fnull.md", "path_with_null.md"},
+		{"path\x7fwith\x7fdel.md", "path_with_del.md"},
+		{"", ""},
+		{"../traversal/attempt", "../traversal/attempt"}, // dots are fine, just control chars sanitized
+	}
+
+	for _, tt := range tests {
+		result := sanitizeDisplayPath(tt.input)
+		if result != tt.expected {
+			t.Errorf("sanitizeDisplayPath(%q) = %q, want %q", tt.input, result, tt.expected)
+		}
+	}
+}
+
+func TestBuildPromptWithContextFilesHeading(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a simple context file
+	contextFile := filepath.Join(repoPath, "doc.md")
+	if err := os.WriteFile(contextFile, []byte("Content here"), 0644); err != nil {
+		t.Fatalf("Failed to write file: %v", err)
+	}
+
+	// Create .roborev.toml
+	configContent := `context_files = ["doc.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	// Should use plain text heading (path is sanitized, no backticks needed)
+	if !strings.Contains(prompt, "### doc.md") {
+		t.Error("Prompt should contain plain text heading for context file")
+	}
+}
+
+func TestBuildPromptWithBackticksInFilename(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create a file with backticks in the name (valid on Unix)
+	// Note: This tests that backticks in filenames don't break prompt structure
+	backtickFile := filepath.Join(repoPath, "file`with`backticks.md")
+	if err := os.WriteFile(backtickFile, []byte("Content with backticks in filename"), 0644); err != nil {
+		// Some filesystems may not allow this - skip test if so
+		t.Skipf("Cannot create file with backticks: %v", err)
+	}
+
+	// Create .roborev.toml
+	configContent := `context_files = ["file` + "`with`" + `backticks.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	prompt, err := BuildSimple(repoPath, targetSHA, "")
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	// Should contain the file content (proves file was processed)
+	if !strings.Contains(prompt, "Content with backticks in filename") {
+		t.Error("Prompt should contain content from file with backticks in name")
+	}
+
+	// Should have context files section
+	if !strings.Contains(prompt, "## Context Files") {
+		t.Error("Prompt should contain context files section")
+	}
+}
+
+func TestBuildDirtyWithContextFiles(t *testing.T) {
+	repoPath := t.TempDir()
+
+	// Create a context file
+	contextFile := filepath.Join(repoPath, "ARCHITECTURE.md")
+	if err := os.WriteFile(contextFile, []byte("# Architecture\n\nDirty context test."), 0644); err != nil {
+		t.Fatalf("Failed to write context file: %v", err)
+	}
+
+	// Create .roborev.toml with context_files
+	configContent := `context_files = ["ARCHITECTURE.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	diff := "diff --git a/foo.go b/foo.go\n+func foo() {}\n"
+	b := NewBuilder(nil)
+
+	prompt, err := b.BuildDirty(repoPath, diff, 0, 0, "test", "")
+	if err != nil {
+		t.Fatalf("BuildDirty failed: %v", err)
+	}
+
+	// Should contain context files section
+	if !strings.Contains(prompt, "## Context Files") {
+		t.Error("BuildDirty prompt should contain context files section")
+	}
+
+	if !strings.Contains(prompt, "Dirty context test") {
+		t.Error("BuildDirty prompt should contain context file content")
+	}
+
+	// Should still have dirty-specific sections
+	if !strings.Contains(prompt, "## Uncommitted Changes") {
+		t.Error("BuildDirty prompt should contain uncommitted changes section")
+	}
+}
+
+func TestBuildRangeWithContextFiles(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	rangeRef := commits[3] + ".." + commits[5]
+
+	// Create a context file
+	contextFile := filepath.Join(repoPath, "GUIDELINES.md")
+	if err := os.WriteFile(contextFile, []byte("# Guidelines\n\nRange context test."), 0644); err != nil {
+		t.Fatalf("Failed to write context file: %v", err)
+	}
+
+	// Create .roborev.toml with context_files
+	configContent := `context_files = ["GUIDELINES.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	b := NewBuilder(nil)
+	prompt, err := b.Build(repoPath, rangeRef, 0, 0, "test", "")
+	if err != nil {
+		t.Fatalf("Build (range) failed: %v", err)
+	}
+
+	// Should contain context files section
+	if !strings.Contains(prompt, "## Context Files") {
+		t.Error("Range prompt should contain context files section")
+	}
+
+	if !strings.Contains(prompt, "Range context test") {
+		t.Error("Range prompt should contain context file content")
+	}
+
+	// Should still have range-specific sections
+	if !strings.Contains(prompt, "## Commit Range") {
+		t.Error("Range prompt should contain commit range section")
+	}
+}
+
+func TestBuildAddressPromptWithContextFiles(t *testing.T) {
+	repoPath := t.TempDir()
+
+	// Create a context file
+	contextFile := filepath.Join(repoPath, "ADR.md")
+	if err := os.WriteFile(contextFile, []byte("# ADR\n\nAddress context test."), 0644); err != nil {
+		t.Fatalf("Failed to write context file: %v", err)
+	}
+
+	// Create .roborev.toml with context_files
+	configContent := `context_files = ["ADR.md"]`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	// Create a mock review
+	review := &storage.Review{
+		JobID:  123,
+		Agent:  "test",
+		Output: "Found some issues to address.",
+	}
+
+	b := NewBuilder(nil)
+	prompt, err := b.BuildAddressPrompt(repoPath, review, nil)
+	if err != nil {
+		t.Fatalf("BuildAddressPrompt failed: %v", err)
+	}
+
+	// Should contain context files section
+	if !strings.Contains(prompt, "## Context Files") {
+		t.Error("Address prompt should contain context files section")
+	}
+
+	if !strings.Contains(prompt, "Address context test") {
+		t.Error("Address prompt should contain context file content")
+	}
+
+	// Should still have address-specific sections
+	if !strings.Contains(prompt, "## Review Findings to Address") {
+		t.Error("Address prompt should contain review findings section")
 	}
 }

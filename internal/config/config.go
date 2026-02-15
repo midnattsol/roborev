@@ -328,6 +328,7 @@ type RepoConfig struct {
 	Model              string   `toml:"model"` // Model for agents (format varies by agent)
 	ReviewContextCount int      `toml:"review_context_count"`
 	ReviewGuidelines   string   `toml:"review_guidelines"`
+	ContextFiles       []string `toml:"context_files"`
 	JobTimeoutMinutes  int      `toml:"job_timeout_minutes"`
 	ExcludedBranches   []string `toml:"excluded_branches"`
 	DisplayName        string   `toml:"display_name"`

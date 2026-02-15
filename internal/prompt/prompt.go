@@ -2,6 +2,10 @@ package prompt
 
 import (
 	"fmt"
+	"io"
+	"log"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/roborev-dev/roborev/internal/config"
@@ -94,6 +98,14 @@ The following are project-specific guidelines for this repository. Take these in
 when reviewing the code - they may override or supplement the default review criteria.
 `
 
+// ContextFilesHeader introduces the context files section
+const ContextFilesHeader = `
+## Context Files
+
+The following files provide additional context for this repository (e.g., ADRs, architecture docs).
+Use this information to better understand the project's design decisions and conventions.
+`
+
 // PreviousAttemptsForCommitHeader introduces previous review attempts for the same commit
 const PreviousAttemptsForCommitHeader = `
 ## Previous Review Attempts
@@ -148,9 +160,10 @@ func (b *Builder) BuildDirty(repoPath, diff string, repoID int64, contextCount i
 	sb.WriteString(GetSystemPrompt(agentName, promptType))
 	sb.WriteString("\n")
 
-	// Add project-specific guidelines if configured
+	// Add project-specific guidelines and context files if configured
 	if repoCfg, err := config.LoadRepoConfig(repoPath); err == nil && repoCfg != nil {
 		b.writeProjectGuidelines(&sb, repoCfg.ReviewGuidelines)
+		b.writeContextFiles(&sb, repoPath, repoCfg.ContextFiles, MaxPromptSize/4)
 	}
 
 	// Get previous reviews for context (use HEAD as reference point)
@@ -214,9 +227,10 @@ func (b *Builder) buildSinglePrompt(repoPath, sha string, repoID int64, contextC
 	sb.WriteString(GetSystemPrompt(agentName, promptType))
 	sb.WriteString("\n")
 
-	// Add project-specific guidelines if configured
+	// Add project-specific guidelines and context files if configured
 	if repoCfg, err := config.LoadRepoConfig(repoPath); err == nil && repoCfg != nil {
 		b.writeProjectGuidelines(&sb, repoCfg.ReviewGuidelines)
+		b.writeContextFiles(&sb, repoPath, repoCfg.ContextFiles, MaxPromptSize/4)
 	}
 
 	// Get previous reviews if requested
@@ -298,9 +312,10 @@ func (b *Builder) buildRangePrompt(repoPath, rangeRef string, repoID int64, cont
 	sb.WriteString(GetSystemPrompt(agentName, promptType))
 	sb.WriteString("\n")
 
-	// Add project-specific guidelines if configured
+	// Add project-specific guidelines and context files if configured
 	if repoCfg, err := config.LoadRepoConfig(repoPath); err == nil && repoCfg != nil {
 		b.writeProjectGuidelines(&sb, repoCfg.ReviewGuidelines)
+		b.writeContextFiles(&sb, repoPath, repoCfg.ContextFiles, MaxPromptSize/4)
 	}
 
 	// Get previous reviews from before the range start
@@ -412,6 +427,280 @@ func (b *Builder) writeProjectGuidelines(sb *strings.Builder, guidelines string)
 	sb.WriteString("\n")
 	sb.WriteString(strings.TrimSpace(guidelines))
 	sb.WriteString("\n\n")
+}
+
+// contextEntry represents a validated context file ready for inclusion.
+// Files are opened one at a time during writeContextFiles to avoid FD exhaustion.
+type contextEntry struct {
+	displayPath   string      // path to show in prompt (relative to repo, sanitized)
+	resolvedPath  string      // canonical path to open
+	size          int64       // file size in bytes
+	validatedInfo os.FileInfo // file info at validation time for TOCTOU check
+}
+
+// writeContextFiles writes the context files section
+func (b *Builder) writeContextFiles(sb *strings.Builder, repoPath string, patterns []string, budget int) {
+	if len(patterns) == 0 {
+		return
+	}
+
+	entries := collectContextEntries(repoPath, patterns)
+	if len(entries) == 0 {
+		return
+	}
+
+	// Conservative overhead for heading (path up to ~150 chars) + fence (up to ~20 backticks) + margins
+	const perFileOverhead = 250
+
+	var content strings.Builder
+	wroteAny := false
+	truncated := false
+
+	for i := range entries {
+		entry := &entries[i]
+
+		// Calculate remaining budget: content.Len() includes header once written
+		remaining := budget - content.Len() - perFileOverhead
+		if remaining <= 0 {
+			truncated = true
+			break
+		}
+
+		// Open, verify, read, and close file - one at a time to avoid FD exhaustion
+		data, err := readContextFileWithTOCTOUCheck(entry.resolvedPath, entry.validatedInfo, remaining)
+		if err != nil {
+			log.Printf("Warning: failed to read context file %s: %v", entry.displayPath, err)
+			continue
+		}
+
+		// Preserve content as-is, only trim a single trailing newline for cleaner fencing
+		fileContent := strings.TrimSuffix(string(data), "\n")
+
+		// Use dynamic fence to prevent content from breaking out
+		fence, ok := fenceForContent(fileContent)
+		if !ok {
+			log.Printf("Warning: context file %s contains unfenceable content (too many backticks), skipping", entry.displayPath)
+			continue
+		}
+
+		// Use plain text heading - path is already sanitized (no control chars)
+		heading := fmt.Sprintf("### %s\n\n%s\n", entry.displayPath, fence)
+		closing := fmt.Sprintf("\n%s\n\n", fence)
+
+		// Write header on first successful file
+		if !wroteAny {
+			content.WriteString(ContextFilesHeader)
+			content.WriteString("\n")
+			wroteAny = true
+		}
+
+		content.WriteString(heading)
+		content.WriteString(fileContent)
+		content.WriteString(closing)
+
+		if int64(len(data)) < entry.size {
+			truncated = true
+			break
+		}
+	}
+
+	if !wroteAny {
+		return
+	}
+
+	if truncated {
+		content.WriteString("... (context truncated due to size)\n\n")
+	}
+
+	sb.WriteString(content.String())
+}
+
+// readContextFileWithTOCTOUCheck opens a file, verifies it matches the validated info,
+// reads up to maxBytes, and closes it. This processes one file at a time to avoid
+// FD exhaustion while still protecting against TOCTOU attacks.
+func readContextFileWithTOCTOUCheck(path string, validatedInfo os.FileInfo, maxBytes int) ([]byte, error) {
+	if maxBytes <= 0 {
+		return nil, nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	// Verify it's still the same file we validated (TOCTOU protection)
+	openInfo, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat after open: %w", err)
+	}
+
+	if !os.SameFile(validatedInfo, openInfo) {
+		return nil, fmt.Errorf("file changed between validation and read")
+	}
+
+	return io.ReadAll(io.LimitReader(f, int64(maxBytes)))
+}
+
+// maxFenceLength is the maximum number of backticks allowed in a fence.
+// Content requiring more backticks cannot be safely fenced and will be skipped.
+const maxFenceLength = 10
+
+// fenceForContent returns a backtick fence that won't be broken by content.
+// Returns empty string and false if content cannot be safely fenced (too many consecutive backticks).
+func fenceForContent(content string) (string, bool) {
+	maxRun := 2 // minimum fence is 3 backticks
+	currentRun := 0
+	for _, r := range content {
+		if r == '`' {
+			currentRun++
+			if currentRun > maxRun {
+				maxRun = currentRun
+			}
+		} else {
+			currentRun = 0
+		}
+	}
+
+	fenceLen := maxRun + 1
+	if fenceLen > maxFenceLength {
+		return "", false // cannot safely fence without exceeding budget
+	}
+	return strings.Repeat("`", fenceLen), true
+}
+
+// sanitizeDisplayPath removes control characters that could break prompt structure
+func sanitizeDisplayPath(path string) string {
+	var sb strings.Builder
+	sb.Grow(len(path))
+	for _, r := range path {
+		if r < 32 || r == 127 { // ASCII control characters
+			sb.WriteRune('_')
+		} else {
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
+}
+
+// collectContextEntries resolves patterns to validated context entries.
+// Returns entries with metadata only - files are opened one at a time during processing.
+func collectContextEntries(repoPath string, patterns []string) []contextEntry {
+	seen := make(map[string]bool)
+	var result []contextEntry
+
+	repoAbs, err := filepath.Abs(repoPath)
+	if err != nil {
+		log.Printf("Warning: failed to resolve repo path: %v", err)
+		return nil
+	}
+
+	// Canonicalize repoAbs to handle symlinked repo roots
+	if canonical, err := filepath.EvalSymlinks(repoAbs); err == nil {
+		repoAbs = canonical
+	}
+
+	for _, pattern := range patterns {
+		isGlob := strings.ContainsAny(pattern, "*?[")
+
+		if isGlob {
+			absPattern := filepath.Join(repoAbs, pattern)
+			matches, err := filepath.Glob(absPattern)
+			if err != nil {
+				log.Printf("Warning: invalid glob pattern %s: %v", pattern, err)
+				continue
+			}
+			for _, match := range matches {
+				if entry := validateContextFile(repoAbs, match, seen); entry != nil {
+					result = append(result, *entry)
+				}
+			}
+		} else {
+			absPath := filepath.Join(repoAbs, pattern)
+			info, err := os.Lstat(absPath)
+			if err != nil {
+				log.Printf("Warning: context file not found: %s", pattern)
+				continue
+			}
+			if !info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
+				log.Printf("Warning: context file is not a regular file, skipping: %s", pattern)
+				continue
+			}
+			if entry := validateContextFile(repoAbs, absPath, seen); entry != nil {
+				result = append(result, *entry)
+			}
+		}
+	}
+
+	if len(result) == 0 {
+		return nil
+	}
+
+	return result
+}
+
+// validateContextFile checks if a path is safe and returns a contextEntry with metadata.
+// The file is NOT opened here - it will be opened during read to avoid FD exhaustion.
+// Returns nil if validation fails.
+func validateContextFile(repoAbs, absPath string, seen map[string]bool) *contextEntry {
+	if !isInsideRepo(repoAbs, absPath) {
+		log.Printf("Warning: context file outside repo, skipping: %s", absPath)
+		return nil
+	}
+
+	resolved, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		log.Printf("Warning: failed to resolve path %s: %v", absPath, err)
+		return nil
+	}
+
+	if !isInsideRepo(repoAbs, resolved) {
+		log.Printf("Warning: context file resolves outside repo, skipping: %s", absPath)
+		return nil
+	}
+
+	// Stat to get file info for validation and later TOCTOU check
+	info, err := os.Stat(resolved)
+	if err != nil {
+		log.Printf("Warning: cannot stat context file %s: %v", absPath, err)
+		return nil
+	}
+
+	if !info.Mode().IsRegular() {
+		log.Printf("Warning: context file is not a regular file, skipping: %s", absPath)
+		return nil
+	}
+
+	// Deduplicate by canonical resolved path to avoid including same file twice
+	if seen[resolved] {
+		return nil
+	}
+	seen[resolved] = true
+
+	relPath, _ := filepath.Rel(repoAbs, absPath)
+	return &contextEntry{
+		displayPath:   sanitizeDisplayPath(relPath),
+		resolvedPath:  resolved,
+		size:          info.Size(),
+		validatedInfo: info,
+	}
+}
+
+// isInsideRepo checks if a path is inside the repo directory
+func isInsideRepo(repoAbs, targetPath string) bool {
+	absTarget, err := filepath.Abs(targetPath)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(repoAbs, absTarget)
+	if err != nil {
+		return false
+	}
+	// Use separator-aware check to avoid false positives on filenames like "..notes.md"
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return !filepath.IsAbs(rel)
 }
 
 // writePreviousAttemptsForGitRef writes previous review attempts for the same git ref (commit or range)
@@ -584,9 +873,10 @@ func (b *Builder) BuildAddressPrompt(repoPath string, review *storage.Review, pr
 	sb.WriteString(GetSystemPrompt(review.Agent, "address"))
 	sb.WriteString("\n")
 
-	// Add project-specific guidelines if configured
+	// Add project-specific guidelines and context files if configured
 	if repoCfg, err := config.LoadRepoConfig(repoPath); err == nil && repoCfg != nil {
 		b.writeProjectGuidelines(&sb, repoCfg.ReviewGuidelines)
+		b.writeContextFiles(&sb, repoPath, repoCfg.ContextFiles, MaxPromptSize/4)
 	}
 
 	// Include previous attempts to avoid repeating failed approaches

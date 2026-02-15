@@ -163,6 +163,34 @@ func TestLoadRepoConfigNoGuidelines(t *testing.T) {
 	}
 }
 
+func TestLoadRepoConfigWithContextFiles(t *testing.T) {
+	tmpDir := newTempRepo(t, `
+agent = "claude-code"
+context_files = ["docs/adr/*.md", "ARCHITECTURE.md"]
+`)
+
+	cfg, err := LoadRepoConfig(tmpDir)
+	if err != nil {
+		t.Fatalf("LoadRepoConfig failed: %v", err)
+	}
+
+	if cfg == nil {
+		t.Fatal("Expected non-nil config")
+	}
+
+	if len(cfg.ContextFiles) != 2 {
+		t.Fatalf("Expected 2 context files, got %d", len(cfg.ContextFiles))
+	}
+
+	if cfg.ContextFiles[0] != "docs/adr/*.md" {
+		t.Errorf("Expected first context file 'docs/adr/*.md', got '%s'", cfg.ContextFiles[0])
+	}
+
+	if cfg.ContextFiles[1] != "ARCHITECTURE.md" {
+		t.Errorf("Expected second context file 'ARCHITECTURE.md', got '%s'", cfg.ContextFiles[1])
+	}
+}
+
 func TestLoadRepoConfigMissing(t *testing.T) {
 	tmpDir := t.TempDir()
 

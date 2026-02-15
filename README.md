@@ -145,6 +145,7 @@ agent = "claude-code"
 review_guidelines = """
 Project-specific review instructions here.
 """
+context_files = ["docs/adr/*.md", "ARCHITECTURE.md"]
 ```
 
 See [configuration guide](https://roborev.io/configuration/) for all options.
