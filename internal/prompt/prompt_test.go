@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/roborev-dev/roborev/internal/storage"
 	"github.com/roborev-dev/roborev/internal/testutil"
@@ -1678,6 +1679,56 @@ func TestSanitizeDisplayPathExactBoundary(t *testing.T) {
 
 	if strings.HasSuffix(result, "...") {
 		t.Error("Path at exact max length should not have '...' suffix")
+	}
+}
+
+func TestSanitizeDisplayPathMultiByteUTF8(t *testing.T) {
+	// "日" is 3 bytes in UTF-8. 166 * 3 = 498 bytes, + "aa" = 500 bytes exactly
+	exactPath := strings.Repeat("日", 166) + "aa"
+	if len(exactPath) != maxDisplayPathLength {
+		t.Fatalf("Test setup wrong: expected %d bytes, got %d", maxDisplayPathLength, len(exactPath))
+	}
+
+	result := sanitizeDisplayPath(exactPath)
+
+	// Should be unchanged - exactly at limit
+	if result != exactPath {
+		t.Errorf("Path at exact max byte length should not be modified, got %d bytes", len(result))
+	}
+
+	// One more byte would exceed - should truncate cleanly
+	overPath := exactPath + "x"
+	result = sanitizeDisplayPath(overPath)
+
+	if !strings.HasSuffix(result, "...") {
+		t.Error("Over-limit path should end with '...'")
+	}
+
+	// Verify valid UTF-8 (no truncation mid-character)
+	if !utf8.ValidString(result) {
+		t.Error("Result should be valid UTF-8, truncation may have split a multi-byte character")
+	}
+
+	// Test case where multi-byte char would cross boundary
+	// 499 bytes of ASCII + one 3-byte char = would be 502 bytes
+	// Should truncate before adding the multi-byte char
+	almostFull := strings.Repeat("a", 499)
+	withMultiByte := almostFull + "日"
+	result = sanitizeDisplayPath(withMultiByte)
+
+	if !utf8.ValidString(result) {
+		t.Error("Result should be valid UTF-8 when multi-byte char crosses boundary")
+	}
+
+	// Should truncate (can't fit the 3-byte char in 1 remaining byte)
+	if !strings.HasSuffix(result, "...") {
+		t.Error("Should truncate when multi-byte char won't fit in remaining budget")
+	}
+
+	// The result should be the 499 'a's plus "..."
+	expected := almostFull + "..."
+	if result != expected {
+		t.Errorf("Expected %d bytes, got %d bytes", len(expected), len(result))
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/roborev-dev/roborev/internal/config"
 	"github.com/roborev-dev/roborev/internal/git"
@@ -596,24 +597,17 @@ const maxDisplayPathLength = 500
 func sanitizeDisplayPath(path string) string {
 	var sb strings.Builder
 	sb.Grow(len(path))
-	runes := []rune(path)
-	for i, r := range runes {
+	for _, r := range path {
+		toWrite := r
 		if isUnsafePathChar(r) {
-			sb.WriteRune('_')
-		} else {
-			sb.WriteRune(r)
+			toWrite = '_'
 		}
-		// Enforce max length - only truncate if we exceed AND there's more input
-		if sb.Len() > maxDisplayPathLength {
-			// Rewind to limit and add ellipsis
-			result := sb.String()[:maxDisplayPathLength] + "..."
-			return result
-		}
-		// At exactly maxDisplayPathLength with more input remaining
-		if sb.Len() == maxDisplayPathLength && i < len(runes)-1 {
+		// Check if adding this rune would exceed max length (UTF-8 safe)
+		if sb.Len()+utf8.RuneLen(toWrite) > maxDisplayPathLength {
 			sb.WriteString("...")
-			break
+			return sb.String()
 		}
+		sb.WriteRune(toWrite)
 	}
 	return sb.String()
 }
