@@ -784,6 +784,7 @@ func (m tuiModel) handleAddressedKey() (tea.Model, tea.Cmd) {
 			jobID = m.currentReview.Job.ID
 			m.setJobAddressed(jobID, newState)
 			m.pendingAddressed[jobID] = pendingState{newState: newState, seq: seq}
+			m.applyStatsDelta(newState)
 		} else {
 			m.pendingReviewAddressed[m.currentReview.ID] = pendingState{newState: newState, seq: seq}
 		}
@@ -797,6 +798,7 @@ func (m tuiModel) handleAddressedKey() (tea.Model, tea.Cmd) {
 			seq := m.addressedSeq
 			*job.Addressed = newState
 			m.pendingAddressed[job.ID] = pendingState{newState: newState, seq: seq}
+			m.applyStatsDelta(newState)
 			if m.hideAddressed && newState {
 				nextIdx := m.findNextVisibleJob(m.selectedIdx)
 				if nextIdx < 0 {
@@ -827,6 +829,20 @@ func (m tuiModel) handleCancelKey() (tea.Model, tea.Cmd) {
 		job.Status = storage.JobStatusCanceled
 		now := time.Now()
 		job.FinishedAt = &now
+		// Canceled jobs are hidden when hideAddressed is active
+		if m.hideAddressed {
+			nextIdx := m.findNextVisibleJob(m.selectedIdx)
+			if nextIdx < 0 {
+				nextIdx = m.findPrevVisibleJob(m.selectedIdx)
+			}
+			if nextIdx < 0 {
+				nextIdx = m.findFirstVisibleJob()
+			}
+			if nextIdx >= 0 {
+				m.selectedIdx = nextIdx
+				m.updateSelectedJobID()
+			}
+		}
 		return m, m.cancelJob(job.ID, oldStatus, oldFinishedAt)
 	}
 	return m, nil
@@ -1079,9 +1095,6 @@ func (m tuiModel) handleJobsMsg(msg tuiJobsMsg) (tea.Model, tea.Cmd) {
 	m.consecutiveErrors = 0
 
 	m.hasMore = msg.hasMore
-	if !msg.append {
-		m.jobStats = msg.stats
-	}
 
 	m.updateDisplayNameCache(msg.jobs)
 
@@ -1101,6 +1114,16 @@ func (m tuiModel) handleJobsMsg(msg tuiJobsMsg) (tea.Model, tea.Cmd) {
 				}
 				break
 			}
+		}
+	}
+
+	if !msg.append {
+		m.jobStats = msg.stats
+		// Re-apply only unconfirmed pending deltas so that
+		// rollback math stays correct without double-counting
+		// entries the server has already absorbed.
+		for _, pending := range m.pendingAddressed {
+			m.applyStatsDelta(pending.newState)
 		}
 	}
 
@@ -1276,6 +1299,8 @@ func (m tuiModel) handleAddressedResultMsg(msg tuiAddressedResultMsg) (tea.Model
 			if msg.jobID > 0 {
 				m.setJobAddressed(msg.jobID, msg.oldState)
 				delete(m.pendingAddressed, msg.jobID)
+				// Reverse the optimistic stats delta
+				m.applyStatsDelta(msg.oldState)
 			} else if msg.reviewID > 0 {
 				delete(m.pendingReviewAddressed, msg.reviewID)
 			}
